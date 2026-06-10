@@ -322,6 +322,258 @@ def cli_main():
     print("\n提醒:訊號僅供參考,進場前請確認停損,並控制單筆部位風險。")
 
 
+# ======================================================================
+# 5a-2. 法人籌碼 + 技術面選股(資料來源:FinMind)
+#   實作規則中「籌碼面 + 技術面」的部分:
+#     做多訊號 C1~C5、C8~C12;風險排除 B8(融資過熱)、B9(股價過熱)、B10(爆量轉弱)
+#   尚未納入(需基本面或董監/處置資料,之後再加):
+#     A1~A8、B1~B7、B11、C6、C7
+#   注意:FinMind 免費版只能逐檔查詢且有用量上限,故股票池預設較小、並做快取。
+# ======================================================================
+FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+CHIP_UNIVERSE = DEFAULT_UNIVERSE[:40]   # 預設掃描檔數(可在介面調整),避免超出免費用量
+_FM_CACHE = {}
+
+# 做多訊號代碼 -> 名稱
+C_SIGNAL_NAMES = {
+    "C1": "外資主導型", "C2": "投信主升段型", "C3": "冷門股轉強型",
+    "C4": "法人共振型", "C5": "自營商領先型", "C8": "法人吃貨型",
+    "C9": "軋空預備型", "C10": "軋空發動型", "C11": "最強主升段型",
+    "C12": "起漲點型",
+}
+
+
+def fm_fetch(dataset, data_id, start_date, token, end_date=None):
+    """向 FinMind v4 取單一資料表(逐檔)。含簡單快取與錯誤處理。"""
+    import requests
+    key = (dataset, data_id, start_date, end_date)
+    if key in _FM_CACHE:
+        return _FM_CACHE[key]
+    params = {"dataset": dataset, "data_id": data_id, "start_date": start_date}
+    if end_date:
+        params["end_date"] = end_date
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        r = requests.get(FINMIND_URL, headers=headers, params=params, timeout=25)
+    except Exception as e:
+        raise RuntimeError(f"連線 FinMind 失敗:{e}")
+    if r.status_code == 402:
+        raise RuntimeError("FinMind 用量已達上限(免費版有每小時上限),請稍後再試或縮小股票池。")
+    if r.status_code in (401, 403):
+        raise RuntimeError("FinMind token 無效或未授權,請確認 token 是否正確。")
+    r.raise_for_status()
+    df = pd.DataFrame(r.json().get("data", []))
+    _FM_CACHE[key] = df
+    return df
+
+
+def _inst_net(df_inst):
+    """三大法人買賣表 -> 每日淨買超(外資/投信/自營)時間序列。"""
+    if df_inst is None or df_inst.empty or "name" not in df_inst:
+        return None
+    d = df_inst.copy()
+    d["net"] = d["buy"].astype(float) - d["sell"].astype(float)
+    piv = d.pivot_table(index="date", columns="name", values="net", aggfunc="sum").fillna(0).sort_index()
+    out = pd.DataFrame(index=piv.index)
+    out["foreign"] = piv.get("Foreign_Investor", 0) + piv.get("Foreign_Dealer_Self", 0)
+    out["trust"] = piv.get("Investment_Trust", 0)
+    out["dealer"] = piv.get("Dealer_self", 0) + piv.get("Dealer_Hedging", 0)
+    return out
+
+
+def _consec_buy(s, n):
+    """最近 n 日是否連續淨買超(>0)。"""
+    if s is None or len(s) < n:
+        return False
+    return bool((s.iloc[-n:] > 0).all())
+
+
+def _turn_to_buy(s, look=5):
+    """是否『由賣轉買』:近期曾賣超、最新一日轉買超。"""
+    if s is None or len(s) < look + 1:
+        return False
+    return bool(s.iloc[-1] > 0 and (s.iloc[-(look + 1):-1] < 0).any())
+
+
+def chip_features(stock_id, token):
+    """抓三張表並計算所有需要的特徵。資料不足回傳 None。"""
+    import datetime as dt
+    today = dt.date.today()
+    p_start = (today - dt.timedelta(days=260)).isoformat()
+    i_start = (today - dt.timedelta(days=70)).isoformat()
+    m_start = (today - dt.timedelta(days=90)).isoformat()
+
+    dfp = fm_fetch("TaiwanStockPrice", stock_id, p_start, token)
+    if dfp is None or dfp.empty or len(dfp) < 65:
+        return None
+    dfp = dfp.sort_values("date").reset_index(drop=True)
+    close = dfp["close"].astype(float)
+    op = dfp["open"].astype(float)
+    vol = dfp["Trading_Volume"].astype(float)
+
+    def ma(n):
+        return close.rolling(n).mean()
+    def vma(n):
+        return vol.rolling(n).mean()
+
+    c0 = float(close.iloc[-1])
+    ma5, ma10, ma20, ma60 = ma(5).iloc[-1], ma(10).iloc[-1], ma(20).iloc[-1], ma(60).iloc[-1]
+    ma5_up = ma(5).iloc[-1] > ma(5).iloc[-4]
+    ma10_up = ma(10).iloc[-1] > ma(10).iloc[-4]
+    ma20_up = ma(20).iloc[-1] > ma(20).iloc[-6]
+    vol0 = float(vol.iloc[-1]); vol20 = float(vma(20).iloc[-1])
+    vol5_mean = float(vol.iloc[-5:].mean()); vol_prev = float(vol.iloc[-25:-5].mean()) if len(vol) >= 25 else vol5_mean
+    ret20 = c0 / float(close.iloc[-21]) - 1 if len(close) >= 21 else 0.0
+    ret60 = c0 / float(close.iloc[-61]) - 1 if len(close) >= 61 else 0.0
+    breakout = c0 > float(close.iloc[-21:-1].max())          # 突破前 20 日高(整理平台/壓力)
+    newhigh60 = c0 >= float(close.iloc[-60:].max())
+    black = c0 < float(op.iloc[-1])
+    up1 = c0 > float(close.iloc[-2])
+    up3 = c0 > float(close.iloc[-2]) > float(close.iloc[-3])
+    vol_spike_black = vol0 > vol20 * 3 and black
+    vol60_black = vol0 >= float(vol.iloc[-60:].max()) and black
+    no_big_black5 = not any(
+        float(vol.iloc[-i]) > vol20 * 3 and float(close.iloc[-i]) < float(op.iloc[-i])
+        for i in range(1, 6))
+    cold = (vol20 * c0) < 1e8                                 # 冷門:日均成交額 < 1 億
+    price_not_fall = c0 >= float(close.iloc[-2])
+
+    # 三大法人
+    inst = _inst_net(fm_fetch("TaiwanStockInstitutionalInvestorsBuySell", stock_id, i_start, token))
+    f = inst["foreign"] if inst is not None else None
+    t = inst["trust"] if inst is not None else None
+    d = inst["dealer"] if inst is not None else None
+    f_net0 = bool(f is not None and f.iloc[-1] > 0)
+    t_net0 = bool(t is not None and t.iloc[-1] > 0)
+    f_no_big_sell5 = bool(f is not None and len(f) >= 5 and (f.iloc[-5:] < 0).sum() <= 1)
+
+    # 融資融券
+    mg = fm_fetch("TaiwanStockMarginPurchaseShortSale", stock_id, m_start, token)
+    margin_chg20 = short_rising = short_fast_drop = margin_not_up = margin_small_up = None
+    if mg is not None and not mg.empty and "MarginPurchaseTodayBalance" in mg:
+        mg = mg.sort_values("date")
+        mbal = mg["MarginPurchaseTodayBalance"].astype(float)
+        sbal = mg["ShortSaleTodayBalance"].astype(float) if "ShortSaleTodayBalance" in mg else None
+        if len(mbal) >= 21:
+            margin_chg20 = float(mbal.iloc[-1] / max(mbal.iloc[-21], 1) - 1)
+        if len(mbal) >= 6:
+            chg5 = float(mbal.iloc[-1] / max(mbal.iloc[-6], 1) - 1)
+            margin_not_up = chg5 <= 0.02
+            margin_small_up = 0 < chg5 < 0.10
+        if sbal is not None and len(sbal) >= 6:
+            short_rising = bool(sbal.iloc[-1] > sbal.iloc[-6])
+            short_fast_drop = (sbal.iloc[-1] / max(sbal.iloc[-6], 1) - 1) < -0.10
+
+    return dict(
+        c0=c0, ma5=ma5, ma10=ma10, ma20=ma20, ma60=ma60,
+        ma5_up=ma5_up, ma10_up=ma10_up, ma20_up=ma20_up,
+        vol0=vol0, vol20=vol20, vol5_mean=vol5_mean, vol_prev=vol_prev,
+        ret20=ret20, ret60=ret60, breakout=breakout, newhigh60=newhigh60,
+        black=black, up1=up1, up3=up3, vol_spike_black=vol_spike_black,
+        vol60_black=vol60_black, no_big_black5=no_big_black5, cold=cold,
+        price_not_fall=price_not_fall,
+        f=f, t=t, d=d, f_net0=f_net0, t_net0=t_net0, f_no_big_sell5=f_no_big_sell5,
+        margin_chg20=margin_chg20, short_rising=short_rising,
+        short_fast_drop=short_fast_drop, margin_not_up=margin_not_up,
+        margin_small_up=margin_small_up,
+    )
+
+
+def chip_signals(f):
+    """依特徵計算做多訊號(C)與風險旗標(B)。回傳 (c_list, b_list)。"""
+    if f is None:
+        return [], []
+    c0, ma20 = f["c0"], f["ma20"]
+    vol_up = f["vol0"] > f["vol20"]                  # 量 > 20日均量
+    vol5_up = f["vol5_mean"] > f["vol_prev"]         # 近5日均量 > 前20日均量
+    along_line = (c0 > f["ma5"] and f["ma5_up"]) or (c0 > f["ma10"] and f["ma10_up"])
+
+    C = []
+    # C1 外資主導型
+    if _consec_buy(f["f"], 3) and c0 > ma20 and f["ma20_up"] and vol5_up and f["f_no_big_sell5"]:
+        C.append("C1")
+    # C2 投信主升段型
+    if _consec_buy(f["t"], 5) and along_line and f["no_big_black5"]:
+        C.append("C2")
+    # C3 冷門股轉強型
+    if f["cold"] and _consec_buy(f["t"], 3) and _turn_to_buy(f["f"]) and f["breakout"] and vol_up:
+        C.append("C3")
+    # C4 法人共振型
+    if _consec_buy(f["f"], 3) and (_consec_buy(f["t"], 1) or _turn_to_buy(f["t"])) and f["breakout"] and vol_up:
+        C.append("C4")
+    # C5 自營商領先型
+    if _consec_buy(f["d"], 3) and (f["f_net0"] or f["t_net0"]) and f["breakout"] and vol_up:
+        C.append("C5")
+    # C8 法人吃貨型
+    if f["up1"] and (_consec_buy(f["f"], 2) or _consec_buy(f["t"], 2)) and (f["margin_not_up"] is True):
+        C.append("C8")
+    # C9 軋空預備型
+    if (f["short_rising"] is True) and f["newhigh60"] and (f["f_net0"] or f["t_net0"]):
+        C.append("C9")
+    # C10 軋空發動型
+    if f["up3"] and (f["short_fast_drop"] is True) and vol_up:
+        C.append("C10")
+    # C11 最強主升段型
+    if (_consec_buy(f["t"], 5) and (_consec_buy(f["f"], 1) or _turn_to_buy(f["f"]))
+            and c0 > ma20 and c0 > f["ma60"] and vol5_up
+            and (f["margin_chg20"] is None or f["margin_chg20"] < 0.2)
+            and (f["short_rising"] is True) and f["price_not_fall"]):
+        C.append("C11")
+    # C12 起漲點型
+    if (_consec_buy(f["f"], 3) and _turn_to_buy(f["t"]) and f["breakout"] and vol_up
+            and (f["margin_small_up"] is True) and (f["short_rising"] is True)):
+        C.append("C12")
+
+    # 風險排除旗標
+    B = []
+    if f["margin_chg20"] is not None and (
+            f["margin_chg20"] > 0.20 or
+            (f["margin_chg20"] > 0.05 and f["margin_chg20"] > f["ret20"])):
+        B.append("B8 融資過熱")
+    if f["ret20"] > 0.40 or f["ret60"] > 0.80:
+        B.append("B9 股價過熱")
+    if f["vol_spike_black"] or f["vol60_black"]:
+        B.append("B10 爆量轉弱")
+    return C, B
+
+
+def run_chip_screen(universe, token, exclude_ids=None, progress=None):
+    """逐檔分析,回傳結果 DataFrame。progress:可選的回呼(i, n, id)。"""
+    exclude_ids = set(exclude_ids or [])
+    rows = []
+    n = len(universe)
+    for i, tw in enumerate(universe):
+        sid = tw.replace(".TWO", "").replace(".TW", "")
+        if progress:
+            progress(i, n, sid)
+        if sid in exclude_ids:
+            continue
+        try:
+            feats = chip_features(sid, token)
+        except RuntimeError:
+            raise                      # 用量/授權錯誤往上拋,讓介面顯示
+        except Exception:
+            continue                   # 個別股票資料問題就略過
+        if feats is None:
+            continue
+        C, B = chip_signals(feats)
+        if B:                          # 命中任一風險排除 -> 跳過
+            continue
+        if not C:                      # 沒有做多訊號 -> 不列入
+            continue
+        rows.append({
+            "代號": sid, "股票名稱": NAME_MAP.get(tw, ""),
+            "收盤": round(feats["c0"], 2),
+            "做多訊號數": len(C),
+            "做多訊號": "、".join(f"{c} {C_SIGNAL_NAMES[c]}" for c in C),
+            "20日漲幅%": round(feats["ret20"] * 100, 1),
+            "量比": round(feats["vol0"] / feats["vol20"], 2) if feats["vol20"] else None,
+        })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("做多訊號數", ascending=False).reset_index(drop=True)
+
+
 # ----------------------------------------------------------------------
 # 5b. Streamlit 介面版(有「一鍵執行」按鈕)
 # ----------------------------------------------------------------------
@@ -331,7 +583,7 @@ def streamlit_main():
     st.title("📈 台股波段操作助手")
     st.caption("⚠️ 本工具為決策輔助,依歷史價量規律計算,不保證獲利、不構成投資建議。")
 
-    tab1, tab2 = st.tabs(["🔍 今日選股", "💼 我的持股"])
+    tab1, tab2, tab3 = st.tabs(["🔍 今日選股(波段)", "💼 我的持股", "🏦 法人籌碼選股"])
 
     with tab1:
         st.write("按下按鈕,程式會掃描股票池並選出最多 10 檔符合波段條件的標的。")
@@ -371,6 +623,51 @@ def streamlit_main():
                                         "建議": a["action"], "理由": a["reason"]})
                 if out:
                     st.dataframe(pd.DataFrame(out), use_container_width=True, hide_index=True)
+
+    with tab3:
+        st.write("依『法人籌碼 + 技術面』規則選股(資料來源:FinMind)。"
+                 "命中做多訊號 C1~C5、C8~C12,且未觸發風險 B8/B9/B10 的股票才會列出。")
+        # token:優先讀 Streamlit Secrets,其次讓使用者在欄位貼上(僅存於本次連線)
+        token = ""
+        try:
+            token = st.secrets.get("FINMIND_TOKEN", "")
+        except Exception:
+            token = ""
+        if not token:
+            token = st.text_input("FinMind API token", type="password",
+                                  help="到 finmindtrade.com 註冊後取得。部署後建議改放在 Streamlit Secrets。")
+        n_stocks = st.slider("掃描檔數(越多越久,免費版有用量上限)", 10, len(CHIP_UNIVERSE), 30, step=5)
+        exclude_txt = st.text_input("手動排除清單(處置/警示/全額交割股,以逗號分隔代號)",
+                                    help="B11 需付費資料源,免費版請在這裡手動填入要排除的代號,例如 2618,3034")
+        st.caption("⚠️ 尚未納入基本面(A)與董監/處置相關(B1~B7、B11、C6、C7)條件,將於下一階段加入。")
+
+        if st.button("🏦 執行法人籌碼選股", type="primary", use_container_width=True):
+            if not token:
+                st.warning("請先填入 FinMind token,或在部署設定的 Secrets 加入 FINMIND_TOKEN。")
+            else:
+                universe = CHIP_UNIVERSE[:n_stocks]
+                exclude_ids = [x.strip() for x in exclude_txt.replace("，", ",").split(",") if x.strip()]
+                bar = st.progress(0.0, text="準備中…")
+                def _cb(i, total, sid):
+                    bar.progress(min((i + 1) / total, 1.0), text=f"分析中 {i+1}/{total}:{sid}")
+                try:
+                    res = run_chip_screen(universe, token, exclude_ids=exclude_ids, progress=_cb)
+                    bar.empty()
+                except RuntimeError as e:
+                    bar.empty()
+                    st.error(str(e))
+                    res = None
+                if res is not None:
+                    if res.empty:
+                        st.warning("目前沒有同時通過風險過濾、又出現法人做多訊號的股票。")
+                    else:
+                        st.success(f"找到 {len(res)} 檔。『做多訊號數』越多代表越多型態同時成立。")
+                        st.dataframe(res, use_container_width=True, hide_index=True)
+                        with st.expander("📖 做多訊號代碼說明"):
+                            st.markdown("\n".join(
+                                f"- **{k} {v}**" for k, v in C_SIGNAL_NAMES.items()))
+                            st.markdown("風險排除:**B8** 融資過熱、**B9** 股價過熱(20日>40% 或 60日>80%)、"
+                                        "**B10** 爆量轉弱(爆量收黑)。命中任一即不列出。")
 
 
 def _running_in_streamlit() -> bool:
