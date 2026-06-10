@@ -352,6 +352,8 @@ def fm_fetch(dataset, data_id, start_date, token, end_date=None):
     params = {"dataset": dataset, "data_id": data_id, "start_date": start_date}
     if end_date:
         params["end_date"] = end_date
+    if token:
+        params["token"] = token          # 部分情況需用 query 參數帶 token
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     try:
         r = requests.get(FINMIND_URL, headers=headers, params=params, timeout=25)
@@ -365,6 +367,18 @@ def fm_fetch(dataset, data_id, start_date, token, end_date=None):
     df = pd.DataFrame(r.json().get("data", []))
     _FM_CACHE[key] = df
     return df
+
+
+def fm_usage(token):
+    """查詢 FinMind 目前用量與每小時上限,用來診斷 token 是否生效。"""
+    import requests
+    try:
+        r = requests.get("https://api.web.finmindtrade.com/v2/user_info",
+                         headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        j = r.json()
+        return j.get("user_count"), j.get("api_request_limit")
+    except Exception:
+        return None, None
 
 
 def _inst_net(df_inst):
@@ -636,10 +650,25 @@ def streamlit_main():
         if not token:
             token = st.text_input("FinMind API token", type="password",
                                   help="到 finmindtrade.com 註冊後取得。部署後建議改放在 Streamlit Secrets。")
-        n_stocks = st.slider("掃描檔數(越多越久,免費版有用量上限)", 10, len(CHIP_UNIVERSE), 30, step=5)
+        n_stocks = st.slider("掃描檔數(越多越久,免費版有用量上限)", 10, len(CHIP_UNIVERSE), 15, step=5)
         exclude_txt = st.text_input("手動排除清單(處置/警示/全額交割股,以逗號分隔代號)",
                                     help="B11 需付費資料源,免費版請在這裡手動填入要排除的代號,例如 2618,3034")
         st.caption("⚠️ 尚未納入基本面(A)與董監/處置相關(B1~B7、B11、C6、C7)條件,將於下一階段加入。")
+
+        if st.button("🔎 檢查我的 FinMind 用量 / 上限", use_container_width=True):
+            if not token:
+                st.warning("請先填入 token。")
+            else:
+                used, limit = fm_usage(token)
+                if limit is None:
+                    st.error("查不到用量,token 可能無效或未生效。")
+                else:
+                    msg = f"目前用量:{used} / 每小時上限:{limit}。"
+                    if limit and limit >= 600:
+                        st.success(msg + " token 已生效 ✅")
+                    else:
+                        st.warning(msg + " 上限偏低,代表 token 未生效或信箱尚未驗證——"
+                                   "請到 FinMind 網站完成『信箱驗證』,並確認 token 正確。")
 
         if st.button("🏦 執行法人籌碼選股", type="primary", use_container_width=True):
             if not token:
