@@ -857,7 +857,10 @@ def backer_fetch_allmarket(dataset, start_date, token, end_date=None):
 
 
 def backer_fetch_price_history(token, days=260):
-    """一次取得全市場近 N 天日 K 線（含 OHLCV），回傳 {stock_id: DataFrame}。"""
+    """一次取得全市場近 N 天日 K 線，回傳 {stock_id: DataFrame}。
+    欄位保持小寫（close/open/max/min/Trading_Volume），
+    與 chip_features 和 add_indicators 的需求一致。
+    """
     import datetime as dt
     start = (dt.date.today() - dt.timedelta(days=days)).isoformat()
     df = backer_fetch_allmarket("TaiwanStockPrice", start, token)
@@ -866,14 +869,13 @@ def backer_fetch_price_history(token, days=260):
     df = df.sort_values(["stock_id", "date"])
     result = {}
     for sid, grp in df.groupby("stock_id"):
-        g = grp[["date", "open", "max", "min", "close",
-                  "Trading_Volume"]].rename(columns={
-            "max": "High", "min": "Low", "close": "Close",
-            "open": "Open", "Trading_Volume": "Volume"
-        }).reset_index(drop=True)
-        g["Close"] = pd.to_numeric(g["Close"], errors="coerce")
-        g["Volume"] = pd.to_numeric(g["Volume"], errors="coerce")
-        g = g.dropna(subset=["Close", "Volume"])
+        # 保持 FinMind 原始小寫欄位：close, open, max, min, Trading_Volume
+        needed = [c for c in ["date", "open", "max", "min", "close", "Trading_Volume"]
+                  if c in grp.columns]
+        g = grp[needed].copy().reset_index(drop=True)
+        g["close"] = pd.to_numeric(g["close"], errors="coerce")
+        g["Trading_Volume"] = pd.to_numeric(g["Trading_Volume"], errors="coerce")
+        g = g.dropna(subset=["close", "Trading_Volume"])
         if len(g) >= 65:
             result[sid] = g
     return result
@@ -931,38 +933,28 @@ def backer_fetch_financials(token, days=900):
 def chip_features_from_cache(sid, price_df, inst_df, margin_df):
     """
     用預先下載好的全市場資料計算單支股票的籌碼特徵。
-    直接構造符合 chip_features 邏輯的特徵，不依賴 fm_fetch monkey-patch。
+    price_df 是 backer_fetch_price_history 回傳的小寫欄位 DataFrame
+    （close/open/max/min/Trading_Volume），剛好符合 chip_features 的需求。
     """
     if price_df is None or len(price_df) < 65:
         return None
     p = price_df.copy()
-    # 統一欄位名稱
-    rename_map = {}
-    if "Close" in p.columns:    rename_map["Close"] = "close"
-    if "Open" in p.columns:     rename_map["Open"] = "open"
-    if "High" in p.columns:     rename_map["High"] = "max"
-    if "Low" in p.columns:      rename_map["Low"] = "min"
-    if "Volume" in p.columns:   rename_map["Volume"] = "Trading_Volume"
-    if rename_map:
-        p = p.rename(columns=rename_map)
-    p["close"] = pd.to_numeric(p["close"], errors="coerce")
-    p["Trading_Volume"] = pd.to_numeric(p["Trading_Volume"], errors="coerce")
+    # 確保有 open 欄位（chip_features 需要）
     if "open" not in p.columns:
         p["open"] = p["close"]
+    p["close"] = pd.to_numeric(p["close"], errors="coerce")
+    p["Trading_Volume"] = pd.to_numeric(p["Trading_Volume"], errors="coerce")
     p = p.dropna(subset=["close", "Trading_Volume"])
     if len(p) < 65:
         return None
 
-    # 建一個臨時的 mock fetch，只在這次呼叫中有效
-    _orig = fm_fetch.__code__ if hasattr(fm_fetch, '__code__') else None
-
-    import types, sys
+    import sys
     mod = sys.modules[__name__]
     _saved = mod.fm_fetch
 
     def _mock(dataset, data_id, start, token_, end_date=None):
         if dataset == "TaiwanStockPrice":
-            return p
+            return p   # 已是 chip_features 期望的小寫欄位格式
         if "Institutional" in dataset:
             return inst_df if inst_df is not None else pd.DataFrame()
         if "Margin" in dataset:
@@ -1026,17 +1018,20 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
     mr_dict = fin_cache.get("TaiwanStockMonthRevenue", {})
 
     if progress: progress("技術面初篩中…", 4, 6)
-    # 用下載好的股價做技術初篩（不需要再打 TWSE API）
+    # 用下載好的股價做技術初篩
+    # price_cache 的欄位是小寫（close/Trading_Volume），
+    # add_indicators 需要 Close/Volume，先 rename 再算
     candidates = []
     for sid, pdf in price_cache.items():
         if sid in exclude_ids:
             continue
         try:
-            df = pdf.rename(columns={"Close": "close", "Volume": "Trading_Volume"}) \
-                if "Close" in pdf.columns else pdf
-            df = add_indicators(df)
-            last = df.iloc[-1]
-            close = float(last.get("Close", last.get("close", 0)))
+            df_ind = pdf.rename(columns={
+                "close": "Close", "Trading_Volume": "Volume"
+            })
+            df_ind = add_indicators(df_ind)
+            last = df_ind.iloc[-1]
+            close = float(last["Close"])
             ma60 = float(last["MA60"]) if not pd.isna(last["MA60"]) else 0
             ma20 = float(last["MA20"]) if not pd.isna(last["MA20"]) else 0
             vol20 = float(last["VOL20"]) if not pd.isna(last["VOL20"]) else 0
@@ -1049,6 +1044,7 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
     if progress: progress(f"分析 {len(candidates)} 支候選股票中…", 5, 6)
 
     rows = []
+    errors = []   # 收集錯誤供診斷
     n = len(candidates)
     for i, sid in enumerate(candidates):
         if progress and i % 50 == 0:
@@ -1058,7 +1054,8 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
         try:
             fund_feats = fundamental_features_from_cache(
                 sid, fs_dict, bs_dict, cf_dict, mr_dict)
-        except Exception:
+        except Exception as e:
+            errors.append(f"{sid} 基本面: {e}")
             fund_feats = None
         fund_include, fund_B, fund_detail = fundamental_eval(fund_feats)
 
@@ -1070,7 +1067,8 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
                 inst_cache.get(sid),
                 margin_cache.get(sid)
             )
-        except Exception:
+        except Exception as e:
+            errors.append(f"{sid} 籌碼: {e}")
             chip_feats = None
         chip_C, chip_B = chip_signals(chip_feats) if chip_feats else ([], [])
 
@@ -1113,14 +1111,15 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
         })
 
     if not rows:
-        return pd.DataFrame()
+        return pd.DataFrame(), candidates, errors
 
     df = pd.DataFrame(rows)
     grade_order = {"⭐⭐ 雙面確認": 0, "📊 基本面通過": 1, "🏦 籌碼訊號": 2}
     df["_g"] = df["綜合評級"].map(grade_order)
     df["_cs"] = df["做多訊號"].str.count("、") + df["做多訊號"].str.len().gt(0).astype(int)
-    return df.sort_values(["_g", "_cs"], ascending=[True, False]) \
-             .drop(columns=["_g", "_cs"]).reset_index(drop=True)
+    return (df.sort_values(["_g", "_cs"], ascending=[True, False])
+              .drop(columns=["_g", "_cs"]).reset_index(drop=True),
+            candidates, errors)
 
 
 # ======================================================================
@@ -2022,7 +2021,7 @@ def streamlit_main():
                     prog.progress(min(step / total, 1.0), text=msg)
                     status_box.info(msg)
                 try:
-                    res = run_full_analysis_backer(
+                    res, candidates, errors = run_full_analysis_backer(
                         token_a,
                         exclude_ids=excl_ids,
                         min_turnover=min_turn_a * 10000,
@@ -2030,8 +2029,18 @@ def streamlit_main():
                     )
                     prog.empty(); status_box.empty()
                     st.session_state["fa_results"] = res
-                    st.session_state["fa_scanned"] = len(res)
-                    st.success(f"全市場掃描完成！找到 {len(res)} 檔符合條件。")
+                    st.session_state["fa_scanned"] = len(candidates)
+                    if res.empty:
+                        st.warning(
+                            f"技術初篩通過 {len(candidates)} 支，但全面分析後無符合條件的股票。"
+                            + (f"\n\n診斷：前 5 筆錯誤：{errors[:5]}" if errors else "")
+                        )
+                    else:
+                        st.success(f"全市場掃描完成！技術初篩 {len(candidates)} 支 → 找到 {len(res)} 檔符合條件。"
+                                   + (f"（{len(errors)} 筆分析例外，可展開診斷查看）" if errors else ""))
+                        if errors:
+                            with st.expander(f"⚠️ 診斷：{len(errors)} 筆分析例外（點開查看）"):
+                                st.text("\n".join(errors[:30]))
                 except RuntimeError as e:
                     prog.empty(); status_box.empty()
                     st.error(str(e))
