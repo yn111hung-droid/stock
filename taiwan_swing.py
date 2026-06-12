@@ -829,7 +829,481 @@ def run_fundamental_screen(universe, token, exclude_ids=None, progress=None):
 
 
 # ======================================================================
-# 5a-4. 策略一：兩階段漏斗 — 全市場技術初篩 + FinMind 基本面精篩
+# 5a-6. Backer 方案：一次抓全市場資料（不帶 data_id）
+#   每張表只需一次請求即可取得全市場當日所有股票，大幅降低用量
+# ======================================================================
+def backer_fetch_allmarket(dataset, start_date, token, end_date=None):
+    """
+    Backer/Sponsor 專用：不帶 data_id，一次取得全市場資料。
+    回傳 DataFrame（含 stock_id 欄位）。
+    """
+    import requests
+    params = {"dataset": dataset, "start_date": start_date}
+    if end_date:
+        params["end_date"] = end_date
+    headers = {"Authorization": f"Bearer {token}"}
+    params["token"] = token
+    try:
+        r = requests.get(FINMIND_URL, headers=headers, params=params, timeout=60)
+    except Exception as e:
+        raise RuntimeError(f"連線 FinMind 失敗：{e}")
+    if r.status_code == 402:
+        raise RuntimeError("FinMind 用量已達上限，請稍後再試。")
+    if r.status_code in (401, 403):
+        raise RuntimeError("FinMind token 無效，請確認 token 與方案是否正確。")
+    r.raise_for_status()
+    df = pd.DataFrame(r.json().get("data", []))
+    return df
+
+
+def backer_fetch_price_history(token, days=260):
+    """一次取得全市場近 N 天日 K 線（含 OHLCV），回傳 {stock_id: DataFrame}。"""
+    import datetime as dt
+    start = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    df = backer_fetch_allmarket("TaiwanStockPrice", start, token)
+    if df.empty or "stock_id" not in df:
+        return {}
+    df = df.sort_values(["stock_id", "date"])
+    result = {}
+    for sid, grp in df.groupby("stock_id"):
+        g = grp[["date", "open", "max", "min", "close",
+                  "Trading_Volume"]].rename(columns={
+            "max": "High", "min": "Low", "close": "Close",
+            "open": "Open", "Trading_Volume": "Volume"
+        }).reset_index(drop=True)
+        g["Close"] = pd.to_numeric(g["Close"], errors="coerce")
+        g["Volume"] = pd.to_numeric(g["Volume"], errors="coerce")
+        g = g.dropna(subset=["Close", "Volume"])
+        if len(g) >= 65:
+            result[sid] = g
+    return result
+
+
+def backer_fetch_institutional(token, days=70):
+    """一次取得全市場三大法人近 N 天資料，回傳 {stock_id: DataFrame}。"""
+    import datetime as dt
+    start = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    df = backer_fetch_allmarket("TaiwanStockInstitutionalInvestorsBuySell", start, token)
+    if df.empty or "stock_id" not in df:
+        return {}
+    result = {}
+    for sid, grp in df.groupby("stock_id"):
+        result[sid] = grp.reset_index(drop=True)
+    return result
+
+
+def backer_fetch_margin(token, days=90):
+    """一次取得全市場融資融券近 N 天資料，回傳 {stock_id: DataFrame}。"""
+    import datetime as dt
+    start = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    df = backer_fetch_allmarket("TaiwanStockMarginPurchaseShortSale", start, token)
+    if df.empty or "stock_id" not in df:
+        return {}
+    result = {}
+    for sid, grp in df.groupby("stock_id"):
+        result[sid] = grp.reset_index(drop=True)
+    return result
+
+
+def backer_fetch_financials(token, days=900):
+    """一次取得全市場財報三表 + 月營收，回傳 {dataset: {stock_id: DataFrame}}。"""
+    import datetime as dt
+    start = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    mr_start = (dt.date.today() - dt.timedelta(days=500)).isoformat()
+    out = {}
+    for ds, s in [
+        ("TaiwanStockFinancialStatements", start),
+        ("TaiwanStockBalanceSheet", start),
+        ("TaiwanStockCashFlowsStatement", start),
+        ("TaiwanStockMonthRevenue", mr_start),
+    ]:
+        df = backer_fetch_allmarket(ds, s, token)
+        if df.empty or "stock_id" not in df:
+            out[ds] = {}
+            continue
+        result = {}
+        for sid, grp in df.groupby("stock_id"):
+            result[sid] = grp.reset_index(drop=True)
+        out[ds] = result
+    return out
+
+
+def chip_features_from_cache(sid, price_df, inst_df, margin_df):
+    """
+    用預先下載好的全市場資料計算單支股票的籌碼特徵。
+    直接構造符合 chip_features 邏輯的特徵，不依賴 fm_fetch monkey-patch。
+    """
+    if price_df is None or len(price_df) < 65:
+        return None
+    p = price_df.copy()
+    # 統一欄位名稱
+    rename_map = {}
+    if "Close" in p.columns:    rename_map["Close"] = "close"
+    if "Open" in p.columns:     rename_map["Open"] = "open"
+    if "High" in p.columns:     rename_map["High"] = "max"
+    if "Low" in p.columns:      rename_map["Low"] = "min"
+    if "Volume" in p.columns:   rename_map["Volume"] = "Trading_Volume"
+    if rename_map:
+        p = p.rename(columns=rename_map)
+    p["close"] = pd.to_numeric(p["close"], errors="coerce")
+    p["Trading_Volume"] = pd.to_numeric(p["Trading_Volume"], errors="coerce")
+    if "open" not in p.columns:
+        p["open"] = p["close"]
+    p = p.dropna(subset=["close", "Trading_Volume"])
+    if len(p) < 65:
+        return None
+
+    # 建一個臨時的 mock fetch，只在這次呼叫中有效
+    _orig = fm_fetch.__code__ if hasattr(fm_fetch, '__code__') else None
+
+    import types, sys
+    mod = sys.modules[__name__]
+    _saved = mod.fm_fetch
+
+    def _mock(dataset, data_id, start, token_, end_date=None):
+        if dataset == "TaiwanStockPrice":
+            return p
+        if "Institutional" in dataset:
+            return inst_df if inst_df is not None else pd.DataFrame()
+        if "Margin" in dataset:
+            return margin_df if margin_df is not None else pd.DataFrame()
+        return pd.DataFrame()
+
+    mod.fm_fetch = _mock
+    try:
+        feats = chip_features(sid, "__cache__")
+    finally:
+        mod.fm_fetch = _saved
+    return feats
+
+
+def fundamental_features_from_cache(sid, fs_dict, bs_dict, cf_dict, mr_dict):
+    """用預先下載好的全市場財報資料計算單支股票的基本面特徵。"""
+    import sys
+    mod = sys.modules[__name__]
+    _saved = mod.fm_fetch
+
+    def _mock(dataset, data_id, start, token_, end_date=None):
+        if "FinancialStatements" in dataset:
+            return fs_dict.get(sid, pd.DataFrame())
+        if "BalanceSheet" in dataset:
+            return bs_dict.get(sid, pd.DataFrame())
+        if "CashFlows" in dataset:
+            return cf_dict.get(sid, pd.DataFrame())
+        if "MonthRevenue" in dataset:
+            return mr_dict.get(sid, pd.DataFrame())
+        return pd.DataFrame()
+
+    mod.fm_fetch = _mock
+    try:
+        feats = fundamental_features(sid, "__cache__")
+    finally:
+        mod.fm_fetch = _saved
+    return feats
+
+
+def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress=None):
+    """
+    Backer 版全面分析：一次下載全市場資料，再對每支跑基本面 + 籌碼面。
+    大幅減少 API 請求次數（從數千次降到約 7 次）。
+    """
+    exclude_ids = set(exclude_ids or [])
+
+    if progress: progress("下載全市場股價資料中…", 0, 6)
+    price_cache = backer_fetch_price_history(token)
+
+    if progress: progress("下載全市場三大法人資料中…", 1, 6)
+    inst_cache = backer_fetch_institutional(token)
+
+    if progress: progress("下載全市場融資融券資料中…", 2, 6)
+    margin_cache = backer_fetch_margin(token)
+
+    if progress: progress("下載全市場財報資料中（約需 1~2 分鐘）…", 3, 6)
+    fin_cache = backer_fetch_financials(token)
+    fs_dict = fin_cache.get("TaiwanStockFinancialStatements", {})
+    bs_dict = fin_cache.get("TaiwanStockBalanceSheet", {})
+    cf_dict = fin_cache.get("TaiwanStockCashFlowsStatement", {})
+    mr_dict = fin_cache.get("TaiwanStockMonthRevenue", {})
+
+    if progress: progress("技術面初篩中…", 4, 6)
+    # 用下載好的股價做技術初篩（不需要再打 TWSE API）
+    candidates = []
+    for sid, pdf in price_cache.items():
+        if sid in exclude_ids:
+            continue
+        try:
+            df = pdf.rename(columns={"Close": "close", "Volume": "Trading_Volume"}) \
+                if "Close" in pdf.columns else pdf
+            df = add_indicators(df)
+            last = df.iloc[-1]
+            close = float(last.get("Close", last.get("close", 0)))
+            ma60 = float(last["MA60"]) if not pd.isna(last["MA60"]) else 0
+            ma20 = float(last["MA20"]) if not pd.isna(last["MA20"]) else 0
+            vol20 = float(last["VOL20"]) if not pd.isna(last["VOL20"]) else 0
+            if (close > ma60 and ma20 > ma60
+                    and close * vol20 >= min_turnover and close > 10):
+                candidates.append(sid)
+        except Exception:
+            continue
+
+    if progress: progress(f"分析 {len(candidates)} 支候選股票中…", 5, 6)
+
+    rows = []
+    n = len(candidates)
+    for i, sid in enumerate(candidates):
+        if progress and i % 50 == 0:
+            progress(f"全面分析中 {i}/{n}…", 5, 6)
+
+        # 基本面
+        try:
+            fund_feats = fundamental_features_from_cache(
+                sid, fs_dict, bs_dict, cf_dict, mr_dict)
+        except Exception:
+            fund_feats = None
+        fund_include, fund_B, fund_detail = fundamental_eval(fund_feats)
+
+        # 籌碼面
+        try:
+            chip_feats = chip_features_from_cache(
+                sid,
+                price_cache.get(sid),
+                inst_cache.get(sid),
+                margin_cache.get(sid)
+            )
+        except Exception:
+            chip_feats = None
+        chip_C, chip_B = chip_signals(chip_feats) if chip_feats else ([], [])
+
+        has_fund = fund_include
+        has_chip = bool(chip_C) and not chip_B
+        if not has_fund and not has_chip:
+            continue
+
+        tw = sid + ".TW"
+        name = NAME_MAP.get(tw, NAME_MAP.get(sid + ".TWO", ""))
+        close = round(chip_feats["c0"], 2) if chip_feats else None
+        ret20 = round(chip_feats["ret20"] * 100, 1) if chip_feats else None
+        vol_ratio = round(chip_feats["vol0"] / chip_feats["vol20"], 2) \
+            if chip_feats and chip_feats.get("vol20") else None
+        eps_last = round(fund_feats["eps_last"], 2) \
+            if fund_feats and fund_feats.get("eps_last") is not None else None
+        eps_ttm = round(fund_feats["eps_ttm"], 2) \
+            if fund_feats and fund_feats.get("eps_ttm") is not None else None
+        rev_yoy = round(fund_feats["rev3_yoy_mean"] * 100, 1) \
+            if fund_feats and fund_feats.get("rev3_yoy_mean") is not None else None
+        debt = round(fund_feats["debt_ratio"] * 100, 1) \
+            if fund_feats and fund_feats.get("debt_ratio") is not None else None
+        fund_pass = sum(1 for v in fund_detail.values() if v) if fund_detail else 0
+        fund_total = len(fund_detail) if fund_detail else 0
+
+        grade = ("⭐⭐ 雙面確認" if has_fund and has_chip
+                 else "📊 基本面通過" if has_fund else "🏦 籌碼訊號")
+
+        rows.append({
+            "代號": sid, "股票名稱": name, "收盤": close,
+            "綜合評級": grade,
+            "基本面通過": "✅" if has_fund else "—",
+            "籌碼訊號": "✅" if has_chip else "—",
+            "做多訊號": "、".join(f"{c} {C_SIGNAL_NAMES[c]}" for c in chip_C),
+            "籌碼風險": "、".join(chip_B) if chip_B else "無",
+            "近季EPS": eps_last, "近四季EPS": eps_ttm,
+            "近三月營收YoY%": rev_yoy, "負債比%": debt,
+            "基本面通過項": f"{fund_pass}/{fund_total}" if fund_total else "—",
+            "20日漲幅%": ret20, "量比": vol_ratio,
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    grade_order = {"⭐⭐ 雙面確認": 0, "📊 基本面通過": 1, "🏦 籌碼訊號": 2}
+    df["_g"] = df["綜合評級"].map(grade_order)
+    df["_cs"] = df["做多訊號"].str.count("、") + df["做多訊號"].str.len().gt(0).astype(int)
+    return df.sort_values(["_g", "_cs"], ascending=[True, False]) \
+             .drop(columns=["_g", "_cs"]).reset_index(drop=True)
+
+
+# ======================================================================
+# 持股池管理（分頁 1 用）：讀寫自訂股票池 Excel
+# ======================================================================
+POOL_COLS = ["代號", "股票名稱", "產業", "備註"]
+
+def empty_pool() -> pd.DataFrame:
+    rows = []
+    for tw, name in NAME_MAP.items():
+        sid = tw.replace(".TW", "").replace(".TWO", "")
+        rows.append({"代號": tw, "股票名稱": name, "產業": "", "備註": ""})
+    return pd.DataFrame(rows)
+
+def read_pool_excel(file_bytes) -> pd.DataFrame:
+    import io
+    df = pd.read_excel(io.BytesIO(file_bytes))
+    for col in POOL_COLS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[POOL_COLS]
+
+# ======================================================================
+# 模擬投資（分頁 4 用）
+# ======================================================================
+SIM_COLS = ["日期", "代號", "股票名稱", "產業", "分數", "有進場訊號",
+            "進場價", "停損價", "目標價", "入選理由", "狀態",
+            "結算價", "損益%", "持有天數", "結算原因"]
+
+DONE_COLS = SIM_COLS  # 相同結構，狀態欄為已完成
+
+def empty_sim() -> pd.DataFrame:
+    return pd.DataFrame(columns=SIM_COLS)
+
+def read_sim_excel(file_bytes) -> tuple:
+    import io
+    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    active = pd.read_excel(xls, "追蹤中") if "追蹤中" in xls.sheet_names else empty_sim()
+    done = pd.read_excel(xls, "已完成") if "已完成" in xls.sheet_names else empty_sim()
+    return active, done
+
+def update_sim_prices(active: pd.DataFrame) -> pd.DataFrame:
+    """抓最新價格，自動判斷是否觸發停損或目標，更新狀態。"""
+    if active.empty:
+        return active
+    import datetime as dt
+    active = active.copy()
+    tickers = active["代號"].dropna().astype(str).unique().tolist()
+    try:
+        hist = fetch_history(tickers, period="5d")
+    except Exception:
+        hist = {}
+    triggered = []
+    for i, row in active.iterrows():
+        tw = str(row["代號"])
+        if tw not in hist or hist[tw].empty:
+            continue
+        cur_p = float(hist[tw]["Close"].iloc[-1])
+        stop = float(row["停損價"]) if pd.notna(row["停損價"]) else None
+        target = float(row["目標價"]) if pd.notna(row["目標價"]) else None
+        entry = float(row["進場價"]) if pd.notna(row["進場價"]) else None
+        if stop and cur_p <= stop:
+            triggered.append((i, cur_p, "停損出場"))
+        elif target and cur_p >= target:
+            triggered.append((i, cur_p, "達目標出場"))
+    done_rows = []
+    drop_idx = []
+    for i, cur_p, reason in triggered:
+        row = active.loc[i].copy()
+        entry = float(row["進場價"])
+        pnl = round((cur_p / entry - 1) * 100, 2)
+        try:
+            days = (dt.date.today() - pd.to_datetime(row["日期"]).date()).days
+        except Exception:
+            days = 0
+        row["狀態"] = "已完成"
+        row["結算價"] = cur_p
+        row["損益%"] = pnl
+        row["持有天數"] = days
+        row["結算原因"] = reason
+        done_rows.append(row)
+        drop_idx.append(i)
+    new_active = active.drop(index=drop_idx).reset_index(drop=True)
+    return new_active, pd.DataFrame(done_rows) if done_rows else pd.DataFrame()
+
+
+def sim_analysis(active: pd.DataFrame, done: pd.DataFrame) -> dict:
+    """計算程式能力分析的各維度統計。"""
+    all_done = done.copy() if not done.empty else pd.DataFrame(columns=SIM_COLS)
+    if all_done.empty:
+        return {}
+
+    pnl = pd.to_numeric(all_done["損益%"], errors="coerce").dropna()
+    win = (pnl > 0).sum()
+    total = len(pnl)
+    stats = {
+        "整體": {
+            "總筆數": total,
+            "勝率%": round(win / total * 100, 1) if total else 0,
+            "平均報酬%": round(pnl.mean(), 2) if total else 0,
+            "最大獲利%": round(pnl.max(), 2) if total else 0,
+            "最大虧損%": round(pnl.min(), 2) if total else 0,
+            "平均持有天數": round(pd.to_numeric(
+                all_done["持有天數"], errors="coerce").mean(), 1) if total else 0,
+        }
+    }
+
+    # 分數分組
+    if "分數" in all_done.columns:
+        all_done["_score"] = pd.to_numeric(all_done["分數"], errors="coerce")
+        bins = [0, 60, 75, 90, 101]
+        labels = ["60以下", "60~74", "75~89", "90+"]
+        all_done["_sg"] = pd.cut(all_done["_score"], bins=bins, labels=labels, right=False)
+        score_grp = []
+        for label in labels:
+            sub = all_done[all_done["_sg"] == label]
+            sub_pnl = pd.to_numeric(sub["損益%"], errors="coerce").dropna()
+            n = len(sub_pnl)
+            score_grp.append({
+                "分數區間": label,
+                "筆數": n,
+                "勝率%": round((sub_pnl > 0).sum() / n * 100, 1) if n else 0,
+                "平均報酬%": round(sub_pnl.mean(), 2) if n else 0,
+            })
+        stats["分數分組"] = pd.DataFrame(score_grp)
+
+    # 進場訊號效果
+    if "有進場訊號" in all_done.columns:
+        signal_grp = []
+        for label, flag in [("有 ✅ 進場訊號", True), ("無進場訊號", False)]:
+            sub = all_done[all_done["有進場訊號"].astype(str).isin(
+                ["True", "✅", "1"] if flag else ["False", "—", "0", ""])]
+            sub_pnl = pd.to_numeric(sub["損益%"], errors="coerce").dropna()
+            n = len(sub_pnl)
+            signal_grp.append({
+                "類型": label, "筆數": n,
+                "勝率%": round((sub_pnl > 0).sum() / n * 100, 1) if n else 0,
+                "平均報酬%": round(sub_pnl.mean(), 2) if n else 0,
+            })
+        stats["進場訊號效果"] = pd.DataFrame(signal_grp)
+
+    # 產業分析
+    if "產業" in all_done.columns:
+        ind_rows = []
+        for ind, grp in all_done.groupby("產業"):
+            if not ind or str(ind) == "nan":
+                continue
+            sub_pnl = pd.to_numeric(grp["損益%"], errors="coerce").dropna()
+            n = len(sub_pnl)
+            if n < 2:
+                continue
+            ind_rows.append({
+                "產業": ind, "筆數": n,
+                "勝率%": round((sub_pnl > 0).sum() / n * 100, 1),
+                "平均報酬%": round(sub_pnl.mean(), 2),
+            })
+        if ind_rows:
+            stats["產業分析"] = pd.DataFrame(ind_rows).sort_values(
+                "勝率%", ascending=False)
+
+    # 月度趨勢
+    if "日期" in all_done.columns:
+        all_done["_month"] = pd.to_datetime(
+            all_done["日期"], errors="coerce").dt.strftime("%Y-%m")
+        month_rows = []
+        for m, grp in all_done.groupby("_month"):
+            if not m or str(m) == "nan":
+                continue
+            sub_pnl = pd.to_numeric(grp["損益%"], errors="coerce").dropna()
+            n = len(sub_pnl)
+            month_rows.append({
+                "月份": m, "推薦筆數": n,
+                "勝率%": round((sub_pnl > 0).sum() / n * 100, 1) if n else 0,
+                "平均報酬%": round(sub_pnl.mean(), 2) if n else 0,
+            })
+        if month_rows:
+            stats["月度趨勢"] = pd.DataFrame(month_rows).sort_values("月份")
+
+    return stats
+
+
+# ======================================================================
+# 5a-4 / 5a-5 現有函式保留（不刪，供免費版相容）
 # ======================================================================
 
 # ── 步驟 A：從 TWSE / TPEX 官方 OpenAPI 取得全市場股票清單 ──────────────
@@ -1164,24 +1638,93 @@ def streamlit_main():
     st.title("📈 台股波段操作助手")
     st.caption("⚠️ 本工具為決策輔助,依歷史價量規律計算,不保證獲利、不構成投資建議。")
 
-    tab1, tab2, tab3 = st.tabs([
-        "🔍 今日選股(波段)", "💼 我的持股", "🔬 全面分析(基本面 + 籌碼)"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🔍 今日選股(波段)", "💼 我的持股",
+        "🔬 全面分析(Backer)", "🎯 模擬投資追蹤"])
 
     with tab1:
-        st.write("按下按鈕,程式會掃描股票池並選出最多 10 檔符合波段條件的標的。")
+        import datetime as _dt
+
+        # ── Session state ─────────────────────────────────────────────
+        if "t1_pool" not in st.session_state:
+            st.session_state["t1_pool"] = empty_pool()
+        if "t1_cand" not in st.session_state:
+            st.session_state["t1_cand"] = pd.DataFrame()
+
+        # ── 股票池管理 ─────────────────────────────────────────────────
+        with st.expander("⚙️ 股票池管理（點開查看/新增/刪除追蹤股票）"):
+            pool = st.session_state["t1_pool"]
+
+            # 上傳自訂股票池
+            up_pool = st.file_uploader("上傳自訂股票池 Excel（可選）",
+                                       type=["xlsx"], key="t1_pool_up")
+            if up_pool:
+                try:
+                    loaded = read_pool_excel(up_pool.read())
+                    st.session_state["t1_pool"] = loaded
+                    pool = loaded
+                    st.success(f"已載入 {len(pool)} 支自訂股票池。")
+                except Exception as e:
+                    st.error(f"讀取失敗：{e}")
+
+            st.caption(f"目前股票池共 **{len(pool)}** 支。可新增、刪除或下載。")
+            st.dataframe(pool, use_container_width=True, hide_index=True, height=220)
+
+            # 新增股票
+            c1, c2, c3, c4 = st.columns(4)
+            new_code = c1.text_input("股票代號（含後綴，如 2330.TW）", key="t1_new_code")
+            new_name = c2.text_input("公司名稱", key="t1_new_name")
+            new_ind  = c3.text_input("產業", key="t1_new_ind")
+            new_note = c4.text_input("備註", key="t1_new_note")
+            if st.button("➕ 新增到股票池", key="t1_add_pool"):
+                code = new_code.strip().upper()
+                if not code:
+                    st.warning("請填入股票代號。")
+                elif code in pool["代號"].values:
+                    st.warning(f"{code} 已在股票池中。")
+                else:
+                    new_row = {"代號": code, "股票名稱": new_name,
+                               "產業": new_ind, "備註": new_note}
+                    st.session_state["t1_pool"] = pd.concat(
+                        [pool, pd.DataFrame([new_row])], ignore_index=True)
+                    st.success(f"已新增 {code}。")
+                    pool = st.session_state["t1_pool"]
+
+            # 刪除股票
+            del_code = st.text_input("輸入要刪除的股票代號", key="t1_del_code")
+            if st.button("🗑️ 從股票池刪除", key="t1_del_pool"):
+                code = del_code.strip().upper()
+                before = len(pool)
+                st.session_state["t1_pool"] = pool[pool["代號"] != code].reset_index(drop=True)
+                if len(st.session_state["t1_pool"]) < before:
+                    st.success(f"已刪除 {code}。")
+                else:
+                    st.warning(f"找不到 {code}。")
+
+            # 下載股票池
+            pool_bytes = df_to_excel_bytes({"股票池": st.session_state["t1_pool"]})
+            st.download_button("📥 下載股票池 Excel",
+                               data=pool_bytes,
+                               file_name="自訂股票池.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True, key="t1_dl_pool")
+
+        # ── 執行篩選 ───────────────────────────────────────────────────
+        st.write("按下按鈕，程式會掃描股票池並選出最多 10 檔符合波段條件的標的。")
         if st.button("🚀 執行今日篩選", type="primary", use_container_width=True):
+            pool_tickers = st.session_state["t1_pool"]["代號"].dropna().astype(str).tolist()
             with st.spinner("抓取資料與計算中…(約 1 分鐘)"):
-                cand, _ = run_screen()
+                cand, _ = run_screen(universe=pool_tickers)
             if cand.empty:
-                st.warning("今日沒有符合條件的標的。整體偏弱時,空手也是一種紀律。")
+                st.warning("今日沒有符合條件的標的。整體偏弱時，空手也是一種紀律。")
+                st.session_state["t1_cand"] = pd.DataFrame()
             else:
                 st.success(f"找到 {len(cand)} 檔候選。✅ 表示同時出現進場訊號。")
                 st.dataframe(cand, use_container_width=True, hide_index=True)
-                with st.expander("📖 欄位說明(點開看每個欄位的意思與「分數」怎麼算)"):
+                with st.expander("📖 欄位說明"):
                     st.markdown(COLUMN_HELP)
-                st.info("「建議停損 / 目標價」為以 1:2 風險報酬比估算的參考值,請依自身資金配置調整。")
-                # ── 下載 Excel ──────────────────────────────────────
-                import datetime as _dt
+                st.info("「建議停損 / 目標價」為以 1:2 風險報酬比估算的參考值。")
+                st.session_state["t1_cand"] = cand
                 today_str = _dt.date.today().strftime("%Y%m%d")
                 excel_bytes = df_to_excel_bytes({"今日選股": cand})
                 st.download_button(
@@ -1189,8 +1732,59 @@ def streamlit_main():
                     data=excel_bytes,
                     file_name=f"選股結果_{today_str}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
+                    use_container_width=True, key="t1_dl_result",
                 )
+
+        # ── 加入模擬投資 ──────────────────────────────────────────────
+        cand = st.session_state.get("t1_cand", pd.DataFrame())
+        if not cand.empty:
+            st.divider()
+            st.markdown("#### 📌 加入模擬投資追蹤")
+            st.caption("選好股票後按按鈕，會加入分頁 4 的模擬追蹤清單。")
+            options = [
+                f"{r['代號']} {r.get('股票名稱','')} (分數:{r['分數']}"
+                f"{'  ✅' if r.get('進場訊號')=='✅' else ''})"
+                for _, r in cand.iterrows()
+            ]
+            selected = st.multiselect("選擇要加入模擬的股票（可多選）",
+                                      options=options,
+                                      default=options,
+                                      key="t1_sim_sel")
+            if st.button("➕ 加入模擬投資追蹤", use_container_width=True, key="t1_add_sim"):
+                sel_set = set(o.split()[0] for o in selected)
+                today = _dt.date.today().isoformat()
+                if "sim_active" not in st.session_state:
+                    st.session_state["sim_active"] = empty_sim()
+                existing_keys = set(
+                    zip(st.session_state["sim_active"]["日期"],
+                        st.session_state["sim_active"]["代號"])
+                ) if not st.session_state["sim_active"].empty else set()
+                added = 0
+                pool_map = {r["代號"]: r.get("產業", "") for _, r in st.session_state["t1_pool"].iterrows()}
+                for _, row in cand.iterrows():
+                    sid = str(row["代號"])
+                    if sid not in sel_set:
+                        continue
+                    if (today, sid) in existing_keys:
+                        continue
+                    new_sim = {
+                        "日期": today, "代號": sid,
+                        "股票名稱": row.get("股票名稱", ""),
+                        "產業": pool_map.get(sid, ""),
+                        "分數": row.get("分數", ""),
+                        "有進場訊號": "✅" if row.get("進場訊號") == "✅" else "—",
+                        "進場價": row.get("收盤", ""),
+                        "停損價": row.get("建議停損", ""),
+                        "目標價": row.get("目標價", ""),
+                        "入選理由": row.get("理由", ""),
+                        "狀態": "追蹤中",
+                        "結算價": "", "損益%": "", "持有天數": "", "結算原因": "",
+                    }
+                    st.session_state["sim_active"] = pd.concat(
+                        [st.session_state["sim_active"], pd.DataFrame([new_sim])],
+                        ignore_index=True)
+                    added += 1
+                st.success(f"已加入 {added} 筆到模擬投資追蹤（分頁 4）。")
 
     with tab2:
         import datetime as _dt
@@ -1382,261 +1976,115 @@ def streamlit_main():
         )
 
     with tab3:
-        st.write("兩階段漏斗：先從全市場技術初篩，再同時做基本面 + 籌碼面全面分析。")
+        st.write("Backer 版全市場掃描：一次下載全市場資料，同時做基本面 + 籌碼面全面分析。")
         st.markdown("""
-**流程說明**
-1. 📡 **第一階段（免費）**：TWSE/TPEX 官方 API 取得全市場 ~1,800 支 → 技術面初篩縮到 100~200 支
-2. 🔬 **第二階段（FinMind）**：對每支同時查基本面（財報三表 + 月營收）+ 籌碼面（三大法人 + 融資券）
-3. ⭐ **結果排序**：雙面確認 > 僅基本面通過 > 僅有籌碼訊號
+**升級優勢（Backer 方案）**
+- 只需 **6~7 次** API 請求即可取得全市場 ~1,800 支股票的所有資料
+- 從原本分兩批等 2 小時，縮短為 **5~10 分鐘**跑完全市場
+- 不需要技術初篩步驟，直接全市場掃描
         """)
-        st.caption("⚠️ 每支查 5 張表，建議每批 ≤ 75 支（≈375次請求），在免費 600次/小時上限內。A8/B7(董監質押)需手動排除。")
+        st.caption("⚠️ A8/B7(董監質押)與 B11(處置/警示股)FinMind 無資料，請手動填入排除清單。")
 
-        # ── Token ─────────────────────────────────────────────────────────
+        # ── Token ─────────────────────────────────────────────────────
         token_a = ""
         try:
             token_a = st.secrets.get("FINMIND_TOKEN", "")
         except Exception:
             pass
         if not token_a:
-            token_a = st.text_input("FinMind API token", type="password", key="token_a")
+            token_a = st.text_input("FinMind API token (Backer)", type="password", key="token_a")
 
         col_a1, col_a2 = st.columns(2)
         min_turn_a = col_a1.number_input(
-            "技術初篩：最低日均成交額（萬元）",
+            "技術篩選：最低日均成交額（萬元）",
             min_value=1000, max_value=50000, value=5000, step=1000, key="min_turn_a"
         )
-        max_batch_a = col_a2.number_input(
-            "每批最多查幾支（建議 ≤ 75，每支查 5 張表）",
-            min_value=20, max_value=150, value=70, step=10, key="max_batch_a"
+        excl_a = col_a2.text_input(
+            "手動排除清單（逗號分隔代號）",
+            key="excl_a", help="例如：2618,3034（董監質押高/警示/處置股）"
         )
 
-        excl_a = st.text_input(
-            "手動排除清單（董監質押過高/警示/全額交割股，逗號分隔）",
-            key="excl_a", help="例如：2618,3034,6477"
-        )
+        # ── Session state ─────────────────────────────────────────────
+        for k, v in [("fa_results", pd.DataFrame()), ("fa_scanned", 0)]:
+            if k not in st.session_state:
+                st.session_state[k] = v
 
         st.divider()
-
-        # ── Session state 初始化 ──────────────────────────────────────────
-        for key, default in [
-            ("fa_universe_ids", []), ("fa_passed", []),
-            ("fa_batch1_done", False), ("fa_results", pd.DataFrame())
-        ]:
-            if key not in st.session_state:
-                st.session_state[key] = default
-
-        # ── 第一階段：全市場技術初篩 ──────────────────────────────────────
-        st.markdown("#### 第一階段：全市場技術初篩（免費，約 3~5 分鐘）")
-        if st.button("📡 執行第一階段：抓全市場 + 技術初篩",
-                     type="primary", use_container_width=True, key="fa_btn_s1"):
-            with st.spinner("從 TWSE/TPEX 取得全市場清單…"):
-                try:
-                    universe_ids = fetch_market_universe()
-                except Exception as e:
-                    st.error(f"取得市場清單失敗：{e}")
-                    universe_ids = []
-
-            if not universe_ids:
-                st.warning("今日可能為假日或尚未收盤，官方 API 暫無資料。請收盤後再試。")
+        if st.button("🔬 執行全市場全面分析（Backer）",
+                     type="primary", use_container_width=True, key="fa_backer_btn"):
+            if not token_a:
+                st.warning("請先填入 FinMind token。")
             else:
-                st.info(f"取得 {len(universe_ids)} 支，開始技術初篩…")
-                bar_tech = st.progress(0.0, text="技術初篩中…")
-                def _cb_tech_a(done, total, sid):
-                    bar_tech.progress(min(done/total, 1.0),
-                                      text=f"技術初篩 {done}/{total}：{sid}")
+                excl_ids = [x.strip() for x in excl_a.replace("，", ",").split(",") if x.strip()]
+                status_box = st.empty()
+                prog = st.progress(0.0)
+                def _cb(msg, step, total):
+                    prog.progress(min(step / total, 1.0), text=msg)
+                    status_box.info(msg)
                 try:
-                    passed = tech_prefilter(universe_ids,
-                                            min_turnover=min_turn_a * 10000,
-                                            progress=_cb_tech_a)
-                except Exception as e:
-                    bar_tech.empty(); st.error(f"技術初篩失敗：{e}"); passed = []
-                bar_tech.empty()
-
-                if not passed:
-                    st.warning("技術初篩後無符合條件的股票，今日大盤可能整體偏弱。")
-                else:
-                    st.session_state["fa_universe_ids"] = universe_ids
-                    st.session_state["fa_passed"] = passed
-                    st.session_state["fa_batch1_done"] = False
-                    st.session_state["fa_results"] = pd.DataFrame()
-                    b1 = passed[:max_batch_a]; b2 = passed[max_batch_a:]
-                    st.success(
-                        f"✅ 初篩完成！{len(universe_ids)} → {len(passed)} 支。"
-                        f"第一批 {len(b1)} 支" +
-                        (f"，第二批 {len(b2)} 支（等一小時後執行）。" if b2 else "，只需一批。")
+                    res = run_full_analysis_backer(
+                        token_a,
+                        exclude_ids=excl_ids,
+                        min_turnover=min_turn_a * 10000,
+                        progress=_cb
                     )
+                    prog.empty(); status_box.empty()
+                    st.session_state["fa_results"] = res
+                    st.session_state["fa_scanned"] = len(res)
+                    st.success(f"全市場掃描完成！找到 {len(res)} 檔符合條件。")
+                except RuntimeError as e:
+                    prog.empty(); status_box.empty()
+                    st.error(str(e))
 
-        passed_a = st.session_state.get("fa_passed", [])
-        universe_ids_a = st.session_state.get("fa_universe_ids", [])
-
-        if passed_a:
-            with st.expander(f"📋 初篩通過名單（{len(passed_a)} 支）"):
-                names = []
-                for sid in passed_a[:60]:
-                    tw = _sid_to_tw(sid, universe_ids_a)
-                    n = NAME_MAP.get(tw, "")
-                    names.append(f"{sid}({n})" if n else sid)
-                st.write("、".join(names) + ("…" if len(passed_a) > 60 else ""))
+        fa_res = st.session_state.get("fa_results", pd.DataFrame())
+        if not fa_res.empty:
+            import datetime as _dt
+            n_both = int((fa_res["綜合評級"] == "⭐⭐ 雙面確認").sum())
+            n_fund = int((fa_res["綜合評級"] == "📊 基本面通過").sum())
+            n_chip = int((fa_res["綜合評級"] == "🏦 籌碼訊號").sum())
 
             st.divider()
+            st.markdown(f"#### 🎯 分析結果：共 {len(fa_res)} 檔")
+            sm1, sm2, sm3, sm4 = st.columns(4)
+            sm1.metric("通過總檔數", len(fa_res))
+            sm2.metric("⭐⭐ 雙面確認", n_both)
+            sm3.metric("📊 僅基本面", n_fund)
+            sm4.metric("🏦 僅籌碼", n_chip)
 
-            # ── 第二階段：全面分析 ────────────────────────────────────────
-            st.markdown("#### 第二階段：全面分析（基本面 + 籌碼面）")
+            df_both = fa_res[fa_res["綜合評級"] == "⭐⭐ 雙面確認"]
+            df_fund = fa_res[fa_res["綜合評級"] == "📊 基本面通過"]
+            df_chip = fa_res[fa_res["綜合評級"] == "🏦 籌碼訊號"]
 
-            batch1_a = passed_a[:max_batch_a]
-            batch2_a = passed_a[max_batch_a:]
+            if not df_both.empty:
+                st.markdown(f"**⭐⭐ 雙面確認（{len(df_both)} 檔）**")
+                st.dataframe(df_both, use_container_width=True, hide_index=True)
+            if not df_fund.empty:
+                st.markdown(f"**📊 僅基本面通過（{len(df_fund)} 檔）**")
+                st.dataframe(df_fund, use_container_width=True, hide_index=True)
+            if not df_chip.empty:
+                st.markdown(f"**🏦 僅有籌碼訊號（{len(df_chip)} 檔）**")
+                st.dataframe(df_chip, use_container_width=True, hide_index=True)
 
-            st.info(
-                f"第一批 **{len(batch1_a)}** 支（約 {len(batch1_a)*5} 次請求）"
-                + (f"，第二批 **{len(batch2_a)}** 支，等一小時後執行。" if batch2_a else "。")
+            today_str = _dt.date.today().strftime("%Y%m%d")
+            summary_df = pd.DataFrame([{
+                "分析日期": today_str, "通過總檔數": len(fa_res),
+                "雙面確認": n_both, "僅基本面": n_fund, "僅籌碼": n_chip,
+            }])
+            st.download_button(
+                "📥 下載全面分析結果 Excel",
+                data=df_to_excel_bytes({"篩選結果": fa_res, "掃描摘要": summary_df}),
+                file_name=f"全面分析_{today_str}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True, key="fa_dl"
             )
 
-            if st.button(f"🔬 執行第一批全面分析（{len(batch1_a)} 支）",
-                         type="primary", use_container_width=True, key="fa_btn_b1"):
-                if not token_a:
-                    st.warning("請先填入 FinMind token。")
-                else:
-                    excl_ids = [x.strip() for x in excl_a.replace("，",",").split(",") if x.strip()]
-                    bar_b1 = st.progress(0.0, text="第一批全面分析中…")
-                    def _cb_b1_a(i, total, sid):
-                        bar_b1.progress(min((i+1)/total, 1.0),
-                                        text=f"分析中 {i+1}/{total}：{sid} （基本面 + 籌碼）")
-                    try:
-                        res1 = run_full_analysis(
-                            [_sid_to_tw(s, universe_ids_a) for s in batch1_a],
-                            token_a, exclude_ids=excl_ids, progress=_cb_b1_a
-                        )
-                        bar_b1.empty()
-                        st.session_state["fa_results"] = res1
-                        st.session_state["fa_batch1_done"] = True
-                        st.success(
-                            f"第一批完成！找到 {len(res1)} 檔。"
-                            + (f" 請等約一小時後執行第二批（{len(batch2_a)} 支）。" if batch2_a else "")
-                        )
-                    except RuntimeError as e:
-                        bar_b1.empty(); st.error(str(e))
-
-            if st.session_state.get("fa_batch1_done") and batch2_a:
-                st.info(f"⏰ 第一批已完成，請等約 1 小時後執行第二批（{len(batch2_a)} 支）。")
-                if st.button(f"🔬 執行第二批全面分析（{len(batch2_a)} 支）",
-                             use_container_width=True, key="fa_btn_b2"):
-                    if not token_a:
-                        st.warning("請先填入 FinMind token。")
-                    else:
-                        excl_ids = [x.strip() for x in excl_a.replace("，",",").split(",") if x.strip()]
-                        bar_b2 = st.progress(0.0, text="第二批全面分析中…")
-                        def _cb_b2_a(i, total, sid):
-                            bar_b2.progress(min((i+1)/total, 1.0),
-                                            text=f"分析中 {i+1}/{total}：{sid}")
-                        try:
-                            res2 = run_full_analysis(
-                                [_sid_to_tw(s, universe_ids_a) for s in batch2_a],
-                                token_a, exclude_ids=excl_ids, progress=_cb_b2_a
-                            )
-                            bar_b2.empty()
-                            combined = pd.concat(
-                                [st.session_state["fa_results"], res2], ignore_index=True
-                            )
-                            # 重新排序
-                            grade_order = {"⭐⭐ 雙面確認": 0, "📊 基本面通過": 1, "🏦 籌碼訊號": 2}
-                            combined["_g"] = combined["綜合評級"].map(grade_order)
-                            combined = combined.sort_values("_g").drop(columns=["_g"]).reset_index(drop=True)
-                            st.session_state["fa_results"] = combined
-                            st.success(f"第二批完成！合計 {len(combined)} 檔。")
-                        except RuntimeError as e:
-                            bar_b2.empty(); st.error(str(e))
-
-            # ── 顯示結果 ──────────────────────────────────────────────────
-            fa_res = st.session_state.get("fa_results", pd.DataFrame())
-            if not fa_res.empty:
-                st.divider()
-
-                # 彙總狀態列
-                import datetime as _dt
-                n_both = int((fa_res["綜合評級"] == "⭐⭐ 雙面確認").sum())
-                n_fund = int((fa_res["綜合評級"] == "📊 基本面通過").sum())
-                n_chip = int((fa_res["綜合評級"] == "🏦 籌碼訊號").sum())
-                n_scanned = len(st.session_state.get("fa_passed", []))
-
-                st.markdown(f"#### 🎯 分析結果：共 {len(fa_res)} 檔")
-                sm1, sm2, sm3, sm4, sm5 = st.columns(5)
-                sm1.metric("掃描總支數", n_scanned)
-                sm2.metric("通過總檔數", len(fa_res))
-                sm3.metric("⭐⭐ 雙面確認", n_both)
-                sm4.metric("📊 僅基本面", n_fund)
-                sm5.metric("🏦 僅籌碼", n_chip)
-
-                # 分三組顯示
-                df_both = fa_res[fa_res["綜合評級"] == "⭐⭐ 雙面確認"]
-                df_fund = fa_res[fa_res["綜合評級"] == "📊 基本面通過"]
-                df_chip = fa_res[fa_res["綜合評級"] == "🏦 籌碼訊號"]
-
-                if not df_both.empty:
-                    st.markdown(f"**⭐⭐ 雙面確認（{len(df_both)} 檔）— 基本面 + 籌碼面同時通過，最值得關注**")
-                    st.dataframe(df_both, use_container_width=True, hide_index=True)
-
-                if not df_fund.empty:
-                    st.markdown(f"**📊 僅基本面通過（{len(df_fund)} 檔）— 體質健康，等待法人進場**")
-                    st.dataframe(df_fund, use_container_width=True, hide_index=True)
-
-                if not df_chip.empty:
-                    st.markdown(f"**🏦 僅有籌碼訊號（{len(df_chip)} 檔）— 法人在買，但基本面待確認**")
-                    st.dataframe(df_chip, use_container_width=True, hide_index=True)
-
-                with st.expander("📖 欄位說明與篩選條件"):
-                    st.markdown("""
-**綜合評級**
-- ⭐⭐ 雙面確認：基本面（A1~A7）全通過 + 籌碼面有做多訊號，最值得進一步研究
-- 📊 基本面通過：財報體質健康，但法人尚未明顯布局
-- 🏦 籌碼訊號：法人正在買進，但基本面資料不足或未全數通過
-
-**基本面條件（A1~A7 納入 / B1~B6 排除）**
-- A1 近季 EPS > 0、近四季合計 > 0；B1 近季 EPS < 0 → 排除
-- A2 近三月營收 YoY 均 > 0；B2 近三月 YoY 皆負 → 排除
-- A3 毛利率 / 營益率未連兩季下滑；B3/B4 連兩季下滑 → 排除
-- A4 近一年營業現金流為正或未明顯惡化
-- A5 負債比 ≤ 70%
-- A6/A7 應收/存貨年增率 ≤ 營收年增率 + 20%；超過 → B5/B6 排除
-
-**籌碼面條件（C1~C5、C8~C12 做多訊號 / B8~B10 風險排除）**
-- 做多：外資連買 ≥3日、投信連買 ≥5日、法人共振、軋空、起漲點…等 10 種型態
-- 排除：B8 融資過熱、B9 股價20日漲幅>40%或60日>80%、B10 爆量轉弱
-
-**A8/B7（董監質押）**：免費資料源無法自動取得，請手動填入排除清單。
-                    """)
-
-                # ── 下載 Excel ────────────────────────────────────────
-                today_str = _dt.date.today().strftime("%Y%m%d")
-                summary_df = pd.DataFrame([{
-                    "分析日期": today_str,
-                    "掃描技術初篩支數": n_scanned,
-                    "通過總檔數": len(fa_res),
-                    "雙面確認": n_both,
-                    "僅基本面通過": n_fund,
-                    "僅籌碼訊號": n_chip,
-                }])
-                excel_fa = df_to_excel_bytes({
-                    "篩選結果": fa_res,
-                    "掃描摘要": summary_df,
-                })
-                st.download_button(
-                    label="📥 下載全面分析結果 Excel",
-                    data=excel_fa,
-                    file_name=f"全面分析_{today_str}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-
-        # ── 診斷工具 ──────────────────────────────────────────────────────
         st.divider()
-        with st.expander("🔬 診斷工具：查看某檔財報欄位 / 檢查 FinMind 用量"):
-            col_d1, col_d2 = st.columns(2)
-            debug_id_a = col_d1.text_input("股票代號（例如 2330）", value="2330", key="debug_id_a")
-            if col_d1.button("查財報欄位", key="debug_btn_a"):
-                if not token_a:
-                    st.warning("請先填入 token。")
-                else:
-                    with st.spinner(f"抓取 {debug_id_a} 的財報欄位…"):
+        with st.expander("🔎 診斷工具"):
+            dc1, dc2 = st.columns(2)
+            debug_id_a = dc1.text_input("股票代號", value="2330", key="debug_id_a")
+            if dc1.button("查財報欄位", key="debug_btn_a"):
+                if token_a:
+                    with st.spinner("抓取中…"):
                         result = fundamental_debug(debug_id_a, token_a)
                     for label, data in result.items():
                         with st.expander(f"📋 {label}"):
@@ -1644,18 +2092,181 @@ def streamlit_main():
                                 st.dataframe(data, use_container_width=True, hide_index=True)
                             else:
                                 st.error(str(data))
-            if col_d2.button("🔎 檢查 FinMind 用量", key="usage_btn_a"):
-                if not token_a:
-                    st.warning("請先填入 token。")
-                else:
+            if dc2.button("🔎 檢查 FinMind 用量", key="usage_btn_a"):
+                if token_a:
                     used, limit = fm_usage(token_a)
                     if limit is None:
-                        st.error("查不到用量，token 可能無效或未生效（請確認信箱已驗證）。")
+                        st.error("查不到用量，token 可能無效。")
                     elif limit >= 600:
-                        st.success(f"目前用量 {used} / 每小時上限 {limit}，token 已生效 ✅")
+                        st.success(f"用量 {used} / 上限 {limit} ✅")
                     else:
-                        st.warning(f"用量 {used} / 上限 {limit}，上限偏低，請至 FinMind 完成信箱驗證。")
+                        st.warning(f"用量 {used} / 上限 {limit}，請確認信箱驗證與方案狀態。")
 
+    with tab4:
+        import datetime as _dt
+        st.write("記錄分頁 1 的推薦結果，追蹤模擬損益，分析程式預測能力。")
+        st.caption("資料存在你的 Excel 檔案中，換裝置時上傳即可延續記錄。")
+
+        # ── Session state ─────────────────────────────────────────────
+        if "sim_active" not in st.session_state:
+            st.session_state["sim_active"] = empty_sim()
+        if "sim_done" not in st.session_state:
+            st.session_state["sim_done"] = empty_sim()
+
+        # ── 上傳記錄 ─────────────────────────────────────────────────
+        with st.expander("📂 上傳模擬投資記錄 Excel", expanded=False):
+            up_sim = st.file_uploader("上傳記錄檔", type=["xlsx"], key="sim_upload")
+            if up_sim:
+                try:
+                    act, dn = read_sim_excel(up_sim.read())
+                    st.session_state["sim_active"] = act
+                    st.session_state["sim_done"] = dn
+                    st.success(f"載入成功：追蹤中 {len(act)} 筆，已完成 {len(dn)} 筆。")
+                except Exception as e:
+                    st.error(f"讀取失敗：{e}")
+
+        # ── 更新價格 / 自動結算 ───────────────────────────────────────
+        active = st.session_state["sim_active"]
+        done = st.session_state["sim_done"]
+
+        if not active.empty:
+            if st.button("🔄 更新現價並自動結算", use_container_width=True, key="sim_update"):
+                with st.spinner("抓取最新價格中…"):
+                    result = update_sim_prices(active)
+                if isinstance(result, tuple):
+                    new_active, triggered = result
+                    if not triggered.empty:
+                        st.session_state["sim_done"] = pd.concat(
+                            [done, triggered], ignore_index=True)
+                        done = st.session_state["sim_done"]
+                        st.success(f"自動結算 {len(triggered)} 筆（停損或達目標）。")
+                    st.session_state["sim_active"] = new_active
+                    active = new_active
+
+        # ── 追蹤中的部位 ──────────────────────────────────────────────
+        st.markdown("#### 📋 追蹤中的模擬部位")
+        if active.empty:
+            st.info("尚無追蹤中的記錄。在分頁 1 執行篩選後，勾選股票加入此清單。")
+        else:
+            # 顯示附現價的追蹤表
+            tickers = active["代號"].dropna().astype(str).tolist()
+            try:
+                hist_p = fetch_history(tickers, period="5d")
+            except Exception:
+                hist_p = {}
+            display = active.copy()
+            display["現價"] = display["代號"].apply(
+                lambda t: round(float(hist_p[t]["Close"].iloc[-1]), 2)
+                if t in hist_p and not hist_p[t].empty else None
+            )
+            display["目前損益%"] = display.apply(
+                lambda r: round((r["現價"] / float(r["進場價"]) - 1) * 100, 2)
+                if pd.notna(r["現價"]) and pd.notna(r["進場價"]) and float(r["進場價"]) > 0
+                else None, axis=1
+            )
+            show_cols = ["日期", "代號", "股票名稱", "分數", "有進場訊號",
+                         "進場價", "停損價", "目標價", "現價", "目前損益%", "狀態"]
+            st.dataframe(display[[c for c in show_cols if c in display.columns]],
+                         use_container_width=True, hide_index=True)
+
+            # 手動結算
+            with st.expander("✏️ 手動結算某筆"):
+                if not active.empty:
+                    opts = [f"{r['日期']} {r['代號']} {r.get('股票名稱','')} 進場:{r['進場價']}"
+                            for _, r in active.iterrows()]
+                    sel_i = st.selectbox("選擇要結算的筆", range(len(opts)),
+                                        format_func=lambda i: opts[i], key="sim_manual_sel")
+                    mc1, mc2, mc3 = st.columns(3)
+                    manual_price = mc1.number_input("結算價", min_value=0.0, step=0.1, key="sim_m_price")
+                    manual_reason = mc2.selectbox("結算原因", ["停損出場", "達目標出場", "主動出場"], key="sim_m_reason")
+                    if mc3.button("確認結算", use_container_width=True, key="sim_m_btn"):
+                        if manual_price > 0:
+                            row = active.iloc[sel_i].copy()
+                            entry = float(row["進場價"]) if pd.notna(row["進場價"]) else 0
+                            pnl = round((manual_price / entry - 1) * 100, 2) if entry > 0 else 0
+                            try:
+                                days = (dt.date.today() - pd.to_datetime(row["日期"]).date()).days
+                            except Exception:
+                                days = 0
+                            row["狀態"] = "已完成"; row["結算價"] = manual_price
+                            row["損益%"] = pnl; row["持有天數"] = days
+                            row["結算原因"] = manual_reason
+                            st.session_state["sim_done"] = pd.concat(
+                                [done, pd.DataFrame([row])], ignore_index=True)
+                            st.session_state["sim_active"] = active.drop(
+                                index=active.index[sel_i]).reset_index(drop=True)
+                            st.success(f"已結算，損益 {pnl:+.2f}%。")
+
+        # ── 已完成紀錄 ────────────────────────────────────────────────
+        st.markdown("#### 📜 已完成紀錄")
+        done = st.session_state["sim_done"]
+        if done.empty:
+            st.info("尚無已完成的模擬記錄。")
+        else:
+            def _color_pnl(val):
+                try:
+                    v = float(val)
+                    return "color:#0F6E56;font-weight:500" if v > 0 else "color:#A32D2D;font-weight:500"
+                except Exception:
+                    return ""
+            st.dataframe(
+                done.style.map(_color_pnl, subset=["損益%"] if "損益%" in done.columns else []),
+                use_container_width=True, hide_index=True
+            )
+
+        # ── 程式能力分析 ──────────────────────────────────────────────
+        st.markdown("#### 📊 程式能力分析")
+        done = st.session_state["sim_done"]
+        if done.empty or len(done) < 3:
+            st.info("需要至少 3 筆已完成記錄才能進行分析。繼續累積數據中！")
+        else:
+            analysis = sim_analysis(st.session_state["sim_active"], done)
+            if analysis:
+                # 整體統計
+                smry = analysis.get("整體", {})
+                if smry:
+                    st.markdown("**整體統計**")
+                    mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+                    mc1.metric("總筆數", smry["總筆數"])
+                    mc2.metric("勝率", f"{smry['勝率%']}%")
+                    mc3.metric("平均報酬", f"{smry['平均報酬%']:+.2f}%")
+                    mc4.metric("最大獲利", f"{smry['最大獲利%']:+.2f}%")
+                    mc5.metric("最大虧損", f"{smry['最大虧損%']:+.2f}%")
+                    mc6.metric("平均持有天", f"{smry['平均持有天數']}天")
+
+                # 分數分組
+                if "分數分組" in analysis:
+                    st.markdown("**分數高低 vs 勝率（驗證高分是否更準）**")
+                    st.dataframe(analysis["分數分組"], use_container_width=True, hide_index=True)
+
+                # 進場訊號效果
+                if "進場訊號效果" in analysis:
+                    st.markdown("**有無 ✅ 進場訊號 vs 勝率**")
+                    st.dataframe(analysis["進場訊號效果"], use_container_width=True, hide_index=True)
+
+                # 產業分析
+                if "產業分析" in analysis:
+                    st.markdown("**各產業勝率排名**")
+                    st.dataframe(analysis["產業分析"], use_container_width=True, hide_index=True)
+
+                # 月度趨勢
+                if "月度趨勢" in analysis:
+                    st.markdown("**月度勝率趨勢（程式在不同市場環境的表現）**")
+                    st.dataframe(analysis["月度趨勢"], use_container_width=True, hide_index=True)
+
+        # ── 下載 / 上傳 ───────────────────────────────────────────────
+        st.divider()
+        sim_excel = df_to_excel_bytes({
+            "追蹤中": st.session_state["sim_active"],
+            "已完成": st.session_state["sim_done"],
+        })
+        st.download_button(
+            "📥 下載模擬投資記錄 Excel",
+            data=sim_excel,
+            file_name="模擬投資記錄.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, key="sim_dl"
+        )
 
 def _running_in_streamlit() -> bool:
     try:
