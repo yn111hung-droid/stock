@@ -902,26 +902,75 @@ def backer_fetch_allmarket(dataset, start_date, token, end_date=None):
 
 def backer_fetch_price_history(token, days=260):
     """一次取得全市場近 N 天日 K 線，回傳 {stock_id: DataFrame}。
-    欄位保持小寫（close/open/max/min/Trading_Volume），
-    與 chip_features 和 add_indicators 的需求一致。
+    自動偵測欄位名稱（FinMind 不同版本欄位可能不同）。
     """
     import datetime as dt
     start = (dt.date.today() - dt.timedelta(days=days)).isoformat()
     df = backer_fetch_allmarket("TaiwanStockPrice", start, token)
-    if df.empty or "stock_id" not in df:
+    if df is None or df.empty:
         return {}
+    if "stock_id" not in df.columns:
+        return {}
+
+    # ── 自動偵測成交量欄位名稱 ─────────────────────────────────────
+    vol_col = None
+    for candidate in ["Trading_Volume", "volume", "Volume",
+                      "trading_volume", "tradeVolume"]:
+        if candidate in df.columns:
+            vol_col = candidate
+            break
+    if vol_col is None:
+        # 找任何含 "vol" 或 "Volume" 的欄位
+        for c in df.columns:
+            if "vol" in c.lower():
+                vol_col = c
+                break
+
+    # ── 自動偵測收盤價欄位名稱 ─────────────────────────────────────
+    close_col = None
+    for candidate in ["close", "Close", "closing_price", "close_price"]:
+        if candidate in df.columns:
+            close_col = candidate
+            break
+
+    if close_col is None or vol_col is None:
+        return {}   # 找不到必要欄位
+
+    # ── 自動偵測開盤價欄位 ─────────────────────────────────────────
+    open_col = None
+    for candidate in ["open", "Open", "open_price"]:
+        if candidate in df.columns:
+            open_col = candidate
+            break
+
+    # 移除無效的 stock_id
+    df = df[df["stock_id"].notna() & (df["stock_id"].astype(str).str.len() > 0)]
+
     df = df.sort_values(["stock_id", "date"])
     result = {}
+
     for sid, grp in df.groupby("stock_id"):
-        # 保持 FinMind 原始小寫欄位：close, open, max, min, Trading_Volume
-        needed = [c for c in ["date", "open", "max", "min", "close", "Trading_Volume"]
-                  if c in grp.columns]
-        g = grp[needed].copy().reset_index(drop=True)
-        g["close"] = pd.to_numeric(g["close"], errors="coerce")
-        g["Trading_Volume"] = pd.to_numeric(g["Trading_Volume"], errors="coerce")
-        g = g.dropna(subset=["close", "Trading_Volume"])
-        if len(g) >= 65:
-            result[sid] = g
+        try:
+            g = grp.copy().reset_index(drop=True)
+            # 統一欄位名稱為小寫（chip_features 需要 close/Trading_Volume）
+            rename = {close_col: "close", vol_col: "Trading_Volume"}
+            if open_col and open_col not in rename:
+                rename[open_col] = "open"
+            g = g.rename(columns=rename)
+            g["close"] = pd.to_numeric(g["close"], errors="coerce")
+            g["Trading_Volume"] = pd.to_numeric(g["Trading_Volume"], errors="coerce")
+            if "open" not in g.columns:
+                g["open"] = g["close"]
+            g = g.dropna(subset=["close", "Trading_Volume"])
+            # 只保留需要的欄位
+            keep = [c for c in ["date", "open", "max", "min", "close",
+                                 "Trading_Volume"] if c in g.columns]
+            g = g[keep]
+            if len(g) >= 65:
+                result[str(sid)] = g
+        except Exception:
+            continue
+
     return result
 
 
@@ -1059,12 +1108,14 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
                          params={"dataset":"TaiwanStockPrice","start_date":start,"token":token},
                          timeout=30)
             raw = r.json()
+            sample_df = pd.DataFrame(raw.get("data",[]))
             diag["API狀態"] = r.status_code
-            diag["回傳欄位"] = list(pd.DataFrame(raw.get("data",[])).columns.tolist()) if raw.get("data") else "data為空"
+            diag["API回傳欄位"] = list(sample_df.columns.tolist()) if not sample_df.empty else "data為空"
+            diag["API回傳筆數"] = len(sample_df)
             diag["msg"] = raw.get("msg","")
         except Exception as e:
             diag["API例外"] = str(e)
-        return pd.DataFrame(), [], diag
+        return pd.DataFrame(), [], [], diag
 
     diag["price_sample_cols"] = list(list(price_cache.values())[0].columns.tolist())
 
