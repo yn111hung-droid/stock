@@ -1044,48 +1044,77 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
     大幅減少 API 請求次數（從數千次降到約 7 次）。
     """
     exclude_ids = set(exclude_ids or [])
+    diag = {}   # 診斷資訊
 
-    if progress: progress("下載全市場股價資料中…", 0, 6)
+    if progress: progress("📡 下載全市場股價資料中…", 0, 6)
     price_cache = backer_fetch_price_history(token)
+    diag["price_cache支數"] = len(price_cache)
+    if not price_cache:
+        # 試著查一下 API 回傳什麼
+        import datetime as dt, requests as _req
+        start = (dt.date.today() - dt.timedelta(days=10)).isoformat()
+        try:
+            r = _req.get(FINMIND_URL,
+                         headers={"Authorization": f"Bearer {token}"},
+                         params={"dataset":"TaiwanStockPrice","start_date":start,"token":token},
+                         timeout=30)
+            raw = r.json()
+            diag["API狀態"] = r.status_code
+            diag["回傳欄位"] = list(pd.DataFrame(raw.get("data",[])).columns.tolist()) if raw.get("data") else "data為空"
+            diag["msg"] = raw.get("msg","")
+        except Exception as e:
+            diag["API例外"] = str(e)
+        return pd.DataFrame(), [], diag
 
-    if progress: progress("下載全市場三大法人資料中…", 1, 6)
+    diag["price_sample_cols"] = list(list(price_cache.values())[0].columns.tolist())
+
+    if progress: progress("📊 下載全市場三大法人資料中…", 1, 6)
     inst_cache = backer_fetch_institutional(token)
+    diag["inst_cache支數"] = len(inst_cache)
 
-    if progress: progress("下載全市場融資融券資料中…", 2, 6)
+    if progress: progress("📈 下載全市場融資融券資料中…", 2, 6)
     margin_cache = backer_fetch_margin(token)
+    diag["margin_cache支數"] = len(margin_cache)
 
-    if progress: progress("下載全市場財報資料中（約需 1~2 分鐘）…", 3, 6)
+    if progress: progress("📋 下載全市場財報資料中（約需 1~2 分鐘）…", 3, 6)
     fin_cache = backer_fetch_financials(token)
     fs_dict = fin_cache.get("TaiwanStockFinancialStatements", {})
     bs_dict = fin_cache.get("TaiwanStockBalanceSheet", {})
     cf_dict = fin_cache.get("TaiwanStockCashFlowsStatement", {})
     mr_dict = fin_cache.get("TaiwanStockMonthRevenue", {})
+    diag["財報支數"] = {k: len(v) for k, v in fin_cache.items()}
 
-    if progress: progress("技術面初篩中…", 4, 6)
-    # 用下載好的股價做技術初篩
-    # price_cache 的欄位是小寫（close/Trading_Volume），
-    # add_indicators 需要 Close/Volume，先 rename 再算
+    if progress: progress("🔍 技術面初篩中…", 4, 6)
     candidates = []
+    tech_fail_reasons = {"ma60":0, "ma20":0, "turnover":0, "price10":0, "error":0}
     for sid, pdf in price_cache.items():
         if sid in exclude_ids:
             continue
         try:
-            df_ind = pdf.rename(columns={
-                "close": "Close", "Trading_Volume": "Volume"
-            })
+            df_ind = pdf.rename(columns={"close": "Close", "Trading_Volume": "Volume"})
             df_ind = add_indicators(df_ind)
             last = df_ind.iloc[-1]
             close = float(last["Close"])
             ma60 = float(last["MA60"]) if not pd.isna(last["MA60"]) else 0
             ma20 = float(last["MA20"]) if not pd.isna(last["MA20"]) else 0
             vol20 = float(last["VOL20"]) if not pd.isna(last["VOL20"]) else 0
-            if (close > ma60 and ma20 > ma60
-                    and close * vol20 >= min_turnover and close > 10):
+            if close <= 10:
+                tech_fail_reasons["price10"] += 1
+            elif close <= ma60:
+                tech_fail_reasons["ma60"] += 1
+            elif ma20 <= ma60:
+                tech_fail_reasons["ma20"] += 1
+            elif close * vol20 < min_turnover:
+                tech_fail_reasons["turnover"] += 1
+            else:
                 candidates.append(sid)
         except Exception:
+            tech_fail_reasons["error"] += 1
             continue
 
-    if progress: progress(f"分析 {len(candidates)} 支候選股票中…", 5, 6)
+    diag["技術初篩通過"] = len(candidates)
+    diag["技術初篩未過原因"] = tech_fail_reasons
+    diag["技術初篩樣本"] = candidates[:5]
 
     rows = []
     errors = []   # 收集錯誤供診斷
@@ -1159,7 +1188,7 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
         })
 
     if not rows:
-        return pd.DataFrame(), candidates, errors
+        return pd.DataFrame(), candidates, errors, diag
 
     df = pd.DataFrame(rows)
     grade_order = {"⭐⭐ 雙面確認": 0, "📊 基本面通過": 1, "🏦 籌碼訊號": 2}
@@ -1167,7 +1196,7 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
     df["_cs"] = df["做多訊號"].str.count("、") + df["做多訊號"].str.len().gt(0).astype(int)
     return (df.sort_values(["_g", "_cs"], ascending=[True, False])
               .drop(columns=["_g", "_cs"]).reset_index(drop=True),
-            candidates, errors)
+            candidates, errors, diag)
 
 
 # ======================================================================
@@ -2070,7 +2099,7 @@ def streamlit_main():
                     prog.progress(min(step / total, 1.0), text=msg)
                     status_box.info(msg)
                 try:
-                    res, candidates, errors = run_full_analysis_backer(
+                    res, candidates, errors, diag = run_full_analysis_backer(
                         token_a,
                         exclude_ids=excl_ids,
                         min_turnover=min_turn_a * 10000,
@@ -2079,17 +2108,27 @@ def streamlit_main():
                     prog.empty(); status_box.empty()
                     st.session_state["fa_results"] = res
                     st.session_state["fa_scanned"] = len(candidates)
+
+                    # ── 診斷摘要（永遠顯示，方便除錯）──────────────────
+                    with st.expander("🔍 執行診斷資訊（點開查看）", expanded=(len(candidates)==0)):
+                        st.json(diag)
+                        if errors:
+                            st.warning(f"分析例外 {len(errors)} 筆（前10筆）：")
+                            st.text("\n".join(errors[:10]))
+
                     if res.empty:
                         st.warning(
-                            f"技術初篩通過 {len(candidates)} 支，但全面分析後無符合條件的股票。"
-                            + (f"\n\n診斷：前 5 筆錯誤：{errors[:5]}" if errors else "")
+                            f"技術初篩通過 **{len(candidates)}** 支，"
+                            f"全面分析後無符合條件的股票。\n\n"
+                            f"請展開上方「執行診斷資訊」查看原因。"
                         )
                     else:
-                        st.success(f"全市場掃描完成！技術初篩 {len(candidates)} 支 → 找到 {len(res)} 檔符合條件。"
-                                   + (f"（{len(errors)} 筆分析例外，可展開診斷查看）" if errors else ""))
-                        if errors:
-                            with st.expander(f"⚠️ 診斷：{len(errors)} 筆分析例外（點開查看）"):
-                                st.text("\n".join(errors[:30]))
+                        st.success(
+                            f"全市場掃描完成！"
+                            f"技術初篩 **{len(candidates)}** 支 → "
+                            f"找到 **{len(res)}** 檔符合條件。"
+                            + (f"（{len(errors)} 筆分析例外）" if errors else "")
+                        )
                 except RuntimeError as e:
                     prog.empty(); status_box.empty()
                     st.error(str(e))
