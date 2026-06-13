@@ -900,7 +900,7 @@ def backer_fetch_allmarket(dataset, start_date, token, end_date=None):
     return df
 
 
-def backer_fetch_price_history(token, days=260):
+def backer_fetch_price_history(token, days=300):
     """一次取得全市場近 N 天日 K 線，回傳 {stock_id: DataFrame}。
     自動偵測欄位名稱（FinMind 不同版本欄位可能不同）。
     """
@@ -920,7 +920,6 @@ def backer_fetch_price_history(token, days=260):
             vol_col = candidate
             break
     if vol_col is None:
-        # 找任何含 "vol" 或 "Volume" 的欄位
         for c in df.columns:
             if "vol" in c.lower():
                 vol_col = c
@@ -934,7 +933,7 @@ def backer_fetch_price_history(token, days=260):
             break
 
     if close_col is None or vol_col is None:
-        return {}   # 找不到必要欄位
+        return {}
 
     # ── 自動偵測開盤價欄位 ─────────────────────────────────────────
     open_col = None
@@ -945,14 +944,12 @@ def backer_fetch_price_history(token, days=260):
 
     # 移除無效的 stock_id
     df = df[df["stock_id"].notna() & (df["stock_id"].astype(str).str.len() > 0)]
-
     df = df.sort_values(["stock_id", "date"])
     result = {}
 
     for sid, grp in df.groupby("stock_id"):
         try:
             g = grp.copy().reset_index(drop=True)
-            # 統一欄位名稱為小寫（chip_features 需要 close/Trading_Volume）
             rename = {close_col: "close", vol_col: "Trading_Volume"}
             if open_col and open_col not in rename:
                 rename[open_col] = "open"
@@ -962,11 +959,12 @@ def backer_fetch_price_history(token, days=260):
             if "open" not in g.columns:
                 g["open"] = g["close"]
             g = g.dropna(subset=["close", "Trading_Volume"])
-            # 只保留需要的欄位
             keep = [c for c in ["date", "open", "max", "min", "close",
                                  "Trading_Volume"] if c in g.columns]
             g = g[keep]
-            if len(g) >= 65:
+            # 最少 20 筆才保留（技術初篩會再過濾；65 筆門檻太高，
+            # 週末或假日期間資料筆數較少會被誤殺）
+            if len(g) >= 20:
                 result[str(sid)] = g
         except Exception:
             continue
@@ -1137,28 +1135,37 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
 
     if progress: progress("🔍 技術面初篩中…", 4, 6)
     candidates = []
-    tech_fail_reasons = {"ma60":0, "ma20":0, "turnover":0, "price10":0, "error":0}
+    tech_fail_reasons = {"ma60": 0, "ma20": 0, "turnover": 0, "price10": 0, "too_short": 0, "error": 0}
     for sid, pdf in price_cache.items():
         if sid in exclude_ids:
             continue
         try:
+            n_rows = len(pdf)
             df_ind = pdf.rename(columns={"close": "Close", "Trading_Volume": "Volume"})
             df_ind = add_indicators(df_ind)
             last = df_ind.iloc[-1]
             close = float(last["Close"])
-            ma60 = float(last["MA60"]) if not pd.isna(last["MA60"]) else 0
-            ma20 = float(last["MA20"]) if not pd.isna(last["MA20"]) else 0
-            vol20 = float(last["VOL20"]) if not pd.isna(last["VOL20"]) else 0
+            ma20 = float(last["MA20"]) if not pd.isna(last.get("MA20", float("nan"))) else None
+            ma60 = float(last["MA60"]) if not pd.isna(last.get("MA60", float("nan"))) else None
+            vol20 = float(last["VOL20"]) if not pd.isna(last.get("VOL20", float("nan"))) else 0
+
+            if n_rows < 20:
+                tech_fail_reasons["too_short"] += 1
+                continue
             if close <= 10:
                 tech_fail_reasons["price10"] += 1
-            elif close <= ma60:
-                tech_fail_reasons["ma60"] += 1
-            elif ma20 <= ma60:
-                tech_fail_reasons["ma20"] += 1
-            elif close * vol20 < min_turnover:
+                continue
+            if close * vol20 < min_turnover:
                 tech_fail_reasons["turnover"] += 1
-            else:
-                candidates.append(sid)
+                continue
+            # MA60 只在資料夠的時候才要求
+            if ma60 is not None and close <= ma60:
+                tech_fail_reasons["ma60"] += 1
+                continue
+            if ma20 is not None and ma60 is not None and ma20 <= ma60:
+                tech_fail_reasons["ma20"] += 1
+                continue
+            candidates.append(sid)
         except Exception:
             tech_fail_reasons["error"] += 1
             continue
