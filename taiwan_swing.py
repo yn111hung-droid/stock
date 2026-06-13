@@ -894,31 +894,54 @@ def backer_fetch_allmarket(dataset, start_date, token, end_date=None):
     if r.status_code == 402:
         raise RuntimeError("FinMind 用量已達上限，請稍後再試。")
     if r.status_code in (401, 403):
-        raise RuntimeError("FinMind token 無效，請確認 token 與方案是否正確。")
+        raise RuntimeError(f"FinMind 授權失敗（HTTP {r.status_code}），請確認 token 正確且方案已生效。")
     r.raise_for_status()
     df = pd.DataFrame(r.json().get("data", []))
     return df
 
 
 def get_latest_trade_date(token):
-    """找最近有交易的日期，自動跳過週末和假日，最多往回查10天。"""
+    """
+    找最近有交易的日期，自動跳過週末和假日，最多往回查14天。
+    注意：只在真正 401/403 時才拋出 token 錯誤，空資料不代表 token 無效。
+    """
     import datetime as dt, requests
     today = dt.date.today()
-    for i in range(10):
+    checked = []
+    for i in range(14):
         d = today - dt.timedelta(days=i)
-        if d.weekday() >= 5:
+        if d.weekday() >= 5:   # 跳過週六(5)、週日(6)
             continue
+        checked.append(d.isoformat())
         try:
-            r = requests.get(FINMIND_URL,
-                params={"dataset":"TaiwanStockPrice","data_id":"2330",
-                        "start_date":d.isoformat(),"end_date":d.isoformat(),
-                        "token":token},
-                headers={"Authorization":f"Bearer {token}"}, timeout=15)
-            if r.json().get("data"):
+            r = requests.get(
+                FINMIND_URL,
+                params={"dataset": "TaiwanStockPrice", "data_id": "2330",
+                        "start_date": d.isoformat(), "end_date": d.isoformat(),
+                        "token": token},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15
+            )
+            # 只有明確 401/403 才代表 token 問題
+            if r.status_code in (401, 403):
+                raise RuntimeError("FinMind token 無效，請確認 token 與方案是否正確。")
+            if r.status_code == 402:
+                raise RuntimeError("FinMind 用量已達上限，請稍後再試。")
+            data = r.json().get("data", [])
+            if data:   # 有資料就代表這天有交易
                 return d.isoformat()
+            # 空資料代表這天沒有交易（假日/停市），繼續往前找
+        except RuntimeError:
+            raise   # 真正的錯誤往上拋
         except Exception:
             continue
-    return (today - dt.timedelta(days=5)).isoformat()
+
+    # 找不到就用 fallback（最近的平日）
+    for i in range(14):
+        d = today - dt.timedelta(days=i)
+        if d.weekday() < 5:
+            return d.isoformat()
+    return (today - dt.timedelta(days=3)).isoformat()
 
 
 def backer_fetch_price_history(token, days=300):
@@ -2152,12 +2175,27 @@ def streamlit_main():
 
         # ── Token ─────────────────────────────────────────────────────
         token_a = ""
+        token_source = ""
         try:
-            token_a = st.secrets.get("FINMIND_TOKEN", "")
+            secrets_token = st.secrets.get("FINMIND_TOKEN", "")
+            if secrets_token and len(secrets_token.strip()) > 10:
+                token_a = secrets_token.strip()
+                token_source = "✅ 從 Streamlit Secrets 讀取"
         except Exception:
             pass
+
         if not token_a:
-            token_a = st.text_input("FinMind API token (Backer)", type="password", key="token_a")
+            token_source = "⚠️ Secrets 未設定或讀取失敗"
+            token_a = st.text_input(
+                "FinMind API token（手動輸入）",
+                type="password", key="token_a",
+                help="到 finmindtrade.com 登入後取得 token"
+            )
+            if token_a:
+                token_source = "✅ 手動輸入"
+
+        if token_source:
+            st.caption(f"Token 狀態：{token_source}")
 
         col_a1, col_a2 = st.columns(2)
         min_turn_a = col_a1.number_input(
