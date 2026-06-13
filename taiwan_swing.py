@@ -900,72 +900,95 @@ def backer_fetch_allmarket(dataset, start_date, token, end_date=None):
     return df
 
 
+def get_latest_trade_date(token):
+    """找最近有交易的日期，自動跳過週末和假日，最多往回查10天。"""
+    import datetime as dt, requests
+    today = dt.date.today()
+    for i in range(10):
+        d = today - dt.timedelta(days=i)
+        if d.weekday() >= 5:
+            continue
+        try:
+            r = requests.get(FINMIND_URL,
+                params={"dataset":"TaiwanStockPrice","data_id":"2330",
+                        "start_date":d.isoformat(),"end_date":d.isoformat(),
+                        "token":token},
+                headers={"Authorization":f"Bearer {token}"}, timeout=15)
+            if r.json().get("data"):
+                return d.isoformat()
+        except Exception:
+            continue
+    return (today - dt.timedelta(days=5)).isoformat()
+
+
 def backer_fetch_price_history(token, days=300):
-    """一次取得全市場近 N 天日 K 線，回傳 {stock_id: DataFrame}。
-    自動偵測欄位名稱（FinMind 不同版本欄位可能不同）。
     """
-    import datetime as dt
-    start = (dt.date.today() - dt.timedelta(days=days)).isoformat()
-    df = backer_fetch_allmarket("TaiwanStockPrice", start, token)
-    if df is None or df.empty:
-        return {}
-    if "stock_id" not in df.columns:
-        return {}
+    Backer 版全市場股價：
+    步驟1 — 全市場查詢取得最近交易日的所有 stock_id
+    步驟2 — 對每支逐檔抓 300 天歷史（確保有足夠資料算 MA60）
+    自動找最近交易日，非交易日也能正常運作。
+    """
+    import datetime as dt, requests
 
-    # ── 自動偵測成交量欄位名稱 ─────────────────────────────────────
-    vol_col = None
-    for candidate in ["Trading_Volume", "volume", "Volume",
-                      "trading_volume", "tradeVolume"]:
-        if candidate in df.columns:
-            vol_col = candidate
-            break
-    if vol_col is None:
-        for c in df.columns:
-            if "vol" in c.lower():
-                vol_col = c
-                break
+    latest = get_latest_trade_date(token)
+    start_30 = (dt.date.fromisoformat(latest) - dt.timedelta(days=30)).isoformat()
 
-    # ── 自動偵測收盤價欄位名稱 ─────────────────────────────────────
-    close_col = None
-    for candidate in ["close", "Close", "closing_price", "close_price"]:
-        if candidate in df.columns:
-            close_col = candidate
-            break
-
-    if close_col is None or vol_col is None:
+    # 步驟1：取全市場代號清單
+    df_all = backer_fetch_allmarket("TaiwanStockPrice", start_30, token, end_date=latest)
+    if df_all is None or df_all.empty or "stock_id" not in df_all.columns:
         return {}
 
-    # ── 自動偵測開盤價欄位 ─────────────────────────────────────────
-    open_col = None
-    for candidate in ["open", "Open", "open_price"]:
-        if candidate in df.columns:
-            open_col = candidate
-            break
+    # 只保留純數字 4~5 碼（排除 ETF 代號如 0050 OK、但排除指數）
+    all_sids = sorted(set(
+        str(s) for s in df_all["stock_id"].dropna().unique()
+        if str(s).isdigit() and 4 <= len(str(s)) <= 5
+    ))
+    if not all_sids:
+        return {}
 
-    # 移除無效的 stock_id
-    df = df[df["stock_id"].notna() & (df["stock_id"].astype(str).str.len() > 0)]
-    df = df.sort_values(["stock_id", "date"])
+    # 步驟2：逐支抓長期歷史
+    start_hist = (dt.date.fromisoformat(latest) - dt.timedelta(days=days)).isoformat()
     result = {}
 
-    for sid, grp in df.groupby("stock_id"):
+    for sid in all_sids:
         try:
-            g = grp.copy().reset_index(drop=True)
-            rename = {close_col: "close", vol_col: "Trading_Volume"}
-            if open_col and open_col not in rename:
-                rename[open_col] = "open"
-            g = g.rename(columns=rename)
+            r = requests.get(
+                FINMIND_URL,
+                headers={"Authorization": f"Bearer {token}"},
+                params={"dataset":"TaiwanStockPrice","data_id":sid,
+                        "start_date":start_hist,"end_date":latest,"token":token},
+                timeout=20
+            )
+            data = r.json().get("data", [])
+            if not data:
+                continue
+            g = pd.DataFrame(data)
+            # 統一欄位
+            close_c = next((c for c in ["close","Close"] if c in g.columns), None)
+            vol_c   = next((c for c in ["Trading_Volume","volume"] if c in g.columns), None)
+            open_c  = next((c for c in ["open","Open"] if c in g.columns), None)
+            money_c = next((c for c in ["Trading_money","trading_money"] if c in g.columns), None)
+            if close_c is None:
+                continue
+            rn = {}
+            if close_c != "close": rn[close_c] = "close"
+            if vol_c and vol_c != "Trading_Volume": rn[vol_c] = "Trading_Volume"
+            if open_c and open_c != "open": rn[open_c] = "open"
+            if money_c and money_c != "Trading_money": rn[money_c] = "Trading_money"
+            if rn: g = g.rename(columns=rn)
             g["close"] = pd.to_numeric(g["close"], errors="coerce")
-            g["Trading_Volume"] = pd.to_numeric(g["Trading_Volume"], errors="coerce")
+            if "Trading_Volume" in g.columns:
+                g["Trading_Volume"] = pd.to_numeric(g["Trading_Volume"], errors="coerce")
+            if "Trading_money" in g.columns:
+                g["Trading_money"] = pd.to_numeric(g["Trading_money"], errors="coerce")
             if "open" not in g.columns:
                 g["open"] = g["close"]
-            g = g.dropna(subset=["close", "Trading_Volume"])
-            keep = [c for c in ["date", "open", "max", "min", "close",
-                                 "Trading_Volume"] if c in g.columns]
-            g = g[keep]
-            # 最少 20 筆才保留（技術初篩會再過濾；65 筆門檻太高，
-            # 週末或假日期間資料筆數較少會被誤殺）
+            g = g.dropna(subset=["close"])
+            keep = [c for c in ["date","open","max","min","close",
+                                 "Trading_Volume","Trading_money"] if c in g.columns]
+            g = g[keep].sort_values("date").reset_index(drop=True)
             if len(g) >= 20:
-                result[str(sid)] = g
+                result[sid] = g
         except Exception:
             continue
 
@@ -1093,7 +1116,9 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
     exclude_ids = set(exclude_ids or [])
     diag = {}   # 診斷資訊
 
-    if progress: progress("📡 下載全市場股價資料中…", 0, 6)
+    if progress: progress("📡 下載全市場股價資料中（先取代號清單，再逐支抓歷史）…", 0, 6)
+    latest_date = get_latest_trade_date(token)
+    diag["最近交易日"] = latest_date
     price_cache = backer_fetch_price_history(token)
     diag["price_cache支數"] = len(price_cache)
     if not price_cache:
@@ -1155,7 +1180,12 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
             if close <= 10:
                 tech_fail_reasons["price10"] += 1
                 continue
-            if close * vol20 < min_turnover:
+            # 流動性：優先用 Trading_money（成交金額），沒有才用量×價
+            if "Trading_money" in pdf.columns:
+                turnover = float(pdf["Trading_money"].iloc[-20:].mean())
+            else:
+                turnover = close * vol20
+            if turnover < min_turnover:
                 tech_fail_reasons["turnover"] += 1
                 continue
             # MA60 只在資料夠的時候才要求
