@@ -370,15 +370,35 @@ def fm_fetch(dataset, data_id, start_date, token, end_date=None):
 
 
 def fm_usage(token):
-    """查詢 FinMind 目前用量與每小時上限,用來診斷 token 是否生效。"""
+    """查詢 FinMind 目前用量與每小時上限，嘗試多個 endpoint。"""
     import requests
-    try:
-        r = requests.get("https://api.web.finmindtrade.com/v2/user_info",
-                         headers={"Authorization": f"Bearer {token}"}, timeout=15)
-        j = r.json()
-        return j.get("user_count"), j.get("api_request_limit")
-    except Exception:
-        return None, None
+    endpoints = [
+        "https://api.finmindtrade.com/api/v4/user/info",
+        "https://api.web.finmindtrade.com/v2/user_info",
+    ]
+    for url in endpoints:
+        try:
+            r = requests.get(url,
+                             headers={"Authorization": f"Bearer {token}"},
+                             params={"token": token},
+                             timeout=15)
+            if r.status_code == 200:
+                j = r.json()
+                # v4 格式
+                if "data" in j and j["data"]:
+                    d = j["data"][0] if isinstance(j["data"], list) else j["data"]
+                    used  = d.get("user_count", d.get("request_count"))
+                    limit = d.get("api_request_limit", d.get("request_limit"))
+                    if used is not None:
+                        return used, limit
+                # v2 格式
+                used  = j.get("user_count")
+                limit = j.get("api_request_limit")
+                if used is not None:
+                    return used, limit
+        except Exception:
+            continue
+    return None, None
 
 
 def _inst_net(df_inst):
@@ -900,46 +920,18 @@ def backer_fetch_allmarket(dataset, start_date, token, end_date=None):
     return df
 
 
-def get_latest_trade_date(token):
+def get_latest_trade_date_simple():
     """
-    找最近有交易的日期，自動跳過週末和假日，最多往回查14天。
-    注意：只在真正 401/403 時才拋出 token 錯誤，空資料不代表 token 無效。
+    不打 API，只用日期邏輯找最近的平日。
+    週六→週五，週日→週五，其他直接回傳今天。
+    用於決定 start_date 的基準，不消耗 API 用量。
     """
-    import datetime as dt, requests
+    import datetime as dt
     today = dt.date.today()
-    checked = []
-    for i in range(14):
+    # 往回找最近平日（跳過週末，假日由 FinMind 資料本身過濾）
+    for i in range(7):
         d = today - dt.timedelta(days=i)
-        if d.weekday() >= 5:   # 跳過週六(5)、週日(6)
-            continue
-        checked.append(d.isoformat())
-        try:
-            r = requests.get(
-                FINMIND_URL,
-                params={"dataset": "TaiwanStockPrice", "data_id": "2330",
-                        "start_date": d.isoformat(), "end_date": d.isoformat(),
-                        "token": token},
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15
-            )
-            # 只有明確 401/403 才代表 token 問題
-            if r.status_code in (401, 403):
-                raise RuntimeError("FinMind token 無效，請確認 token 與方案是否正確。")
-            if r.status_code == 402:
-                raise RuntimeError("FinMind 用量已達上限，請稍後再試。")
-            data = r.json().get("data", [])
-            if data:   # 有資料就代表這天有交易
-                return d.isoformat()
-            # 空資料代表這天沒有交易（假日/停市），繼續往前找
-        except RuntimeError:
-            raise   # 真正的錯誤往上拋
-        except Exception:
-            continue
-
-    # 找不到就用 fallback（最近的平日）
-    for i in range(14):
-        d = today - dt.timedelta(days=i)
-        if d.weekday() < 5:
+        if d.weekday() < 5:   # 0=週一 ... 4=週五
             return d.isoformat()
     return (today - dt.timedelta(days=3)).isoformat()
 
@@ -947,57 +939,60 @@ def get_latest_trade_date(token):
 def backer_fetch_price_history(token, days=300):
     """
     Backer 版全市場股價：
-    步驟1 — 全市場查詢取得最近交易日的所有 stock_id
-    步驟2 — 對每支逐檔抓 300 天歷史（確保有足夠資料算 MA60）
-    自動找最近交易日，非交易日也能正常運作。
+    - 分三段時間區間呼叫全市場查詢（共 3 次請求）
+    - 合併後取得每支股票 ~300 天的歷史資料
+    - 完全不做逐支查詢，保持 Backer「低請求數」的優勢
+    - 自動跳過週末，非交易日也不會報錯
     """
-    import datetime as dt, requests
+    import datetime as dt
 
-    latest = get_latest_trade_date(token)
-    start_30 = (dt.date.fromisoformat(latest) - dt.timedelta(days=30)).isoformat()
+    latest = get_latest_trade_date_simple()
+    end_dt = dt.date.fromisoformat(latest)
 
-    # 步驟1：取全市場代號清單
-    df_all = backer_fetch_allmarket("TaiwanStockPrice", start_30, token, end_date=latest)
-    if df_all is None or df_all.empty or "stock_id" not in df_all.columns:
+    # 分三段抓（每段 100 天），FinMind 全市場查詢每次約回傳 180,000 筆以內
+    # 三段合計 ~300 天，每支有 ~210 個交易日（約 300 天 × 5/7）
+    segments = []
+    for seg in range(3):
+        seg_end   = end_dt - dt.timedelta(days=seg * 100)
+        seg_start = seg_end - dt.timedelta(days=100)
+        df_seg = backer_fetch_allmarket(
+            "TaiwanStockPrice",
+            seg_start.isoformat(), token,
+            end_date=seg_end.isoformat()
+        )
+        if df_seg is not None and not df_seg.empty:
+            segments.append(df_seg)
+
+    if not segments:
         return {}
 
-    # 只保留純數字 4~5 碼（排除 ETF 代號如 0050 OK、但排除指數）
-    all_sids = sorted(set(
-        str(s) for s in df_all["stock_id"].dropna().unique()
-        if str(s).isdigit() and 4 <= len(str(s)) <= 5
-    ))
-    if not all_sids:
+    df = pd.concat(segments, ignore_index=True)
+    if "stock_id" not in df.columns:
         return {}
 
-    # 步驟2：逐支抓長期歷史
-    start_hist = (dt.date.fromisoformat(latest) - dt.timedelta(days=days)).isoformat()
+    # 偵測欄位名稱
+    close_col  = next((c for c in ["close","Close"] if c in df.columns), None)
+    vol_col    = next((c for c in ["Trading_Volume","volume","Volume"] if c in df.columns), None)
+    open_col   = next((c for c in ["open","Open"] if c in df.columns), None)
+    money_col  = next((c for c in ["Trading_money","trading_money"] if c in df.columns), None)
+    if close_col is None:
+        return {}
+
+    # 移除無效 stock_id（只保留純數字 4~5 碼）
+    df = df[df["stock_id"].notna()]
+    df = df[df["stock_id"].astype(str).str.match(r"^\d{4,5}$")]
+    df = df.sort_values(["stock_id", "date"]).drop_duplicates(
+        subset=["stock_id", "date"])
+
     result = {}
-
-    for sid in all_sids:
+    for sid, grp in df.groupby("stock_id"):
         try:
-            r = requests.get(
-                FINMIND_URL,
-                headers={"Authorization": f"Bearer {token}"},
-                params={"dataset":"TaiwanStockPrice","data_id":sid,
-                        "start_date":start_hist,"end_date":latest,"token":token},
-                timeout=20
-            )
-            data = r.json().get("data", [])
-            if not data:
-                continue
-            g = pd.DataFrame(data)
-            # 統一欄位
-            close_c = next((c for c in ["close","Close"] if c in g.columns), None)
-            vol_c   = next((c for c in ["Trading_Volume","volume"] if c in g.columns), None)
-            open_c  = next((c for c in ["open","Open"] if c in g.columns), None)
-            money_c = next((c for c in ["Trading_money","trading_money"] if c in g.columns), None)
-            if close_c is None:
-                continue
+            g = grp.copy().reset_index(drop=True)
             rn = {}
-            if close_c != "close": rn[close_c] = "close"
-            if vol_c and vol_c != "Trading_Volume": rn[vol_c] = "Trading_Volume"
-            if open_c and open_c != "open": rn[open_c] = "open"
-            if money_c and money_c != "Trading_money": rn[money_c] = "Trading_money"
+            if close_col != "close":   rn[close_col] = "close"
+            if vol_col and vol_col != "Trading_Volume": rn[vol_col] = "Trading_Volume"
+            if open_col and open_col != "open":         rn[open_col] = "open"
+            if money_col and money_col != "Trading_money": rn[money_col] = "Trading_money"
             if rn: g = g.rename(columns=rn)
             g["close"] = pd.to_numeric(g["close"], errors="coerce")
             if "Trading_Volume" in g.columns:
@@ -1009,14 +1004,13 @@ def backer_fetch_price_history(token, days=300):
             g = g.dropna(subset=["close"])
             keep = [c for c in ["date","open","max","min","close",
                                  "Trading_Volume","Trading_money"] if c in g.columns]
-            g = g[keep].sort_values("date").reset_index(drop=True)
+            g = g[keep]
             if len(g) >= 20:
-                result[sid] = g
+                result[str(sid)] = g
         except Exception:
             continue
 
     return result
-
 
 def backer_fetch_institutional(token, days=70):
     """一次取得全市場三大法人近 N 天資料，回傳 {stock_id: DataFrame}。"""
@@ -1139,9 +1133,9 @@ def run_full_analysis_backer(token, exclude_ids=None, min_turnover=5e7, progress
     exclude_ids = set(exclude_ids or [])
     diag = {}   # 診斷資訊
 
-    if progress: progress("📡 下載全市場股價資料中（先取代號清單，再逐支抓歷史）…", 0, 6)
-    latest_date = get_latest_trade_date(token)
-    diag["最近交易日"] = latest_date
+    if progress: progress("📡 下載全市場股價資料中（3次全市場請求，共約300天）…", 0, 6)
+    latest_date = get_latest_trade_date_simple()
+    diag["最近平日"] = latest_date
     price_cache = backer_fetch_price_history(token)
     diag["price_cache支數"] = len(price_cache)
     if not price_cache:
@@ -1833,6 +1827,16 @@ def streamlit_main():
     with tab1:
         import datetime as _dt
 
+        # ── 功能說明 ───────────────────────────────────────────────────
+        st.info("""
+**🔍 今日選股（波段）** — 從你的股票池中找出今天符合波段做多條件的標的
+
+📋 **功能**：掃描股票池（預設 70 支），計算技術指標（均線、RSI、MACD、量比），
+依評分排出最多 10 支候選，標示 ✅ 進場訊號，附建議停損和目標價。
+
+⏰ **建議執行時間**：**週一至週五收盤後（14:00 以後）**
+盤中執行的資料仍在變動，K 棒未收盤，訊號可能不準確。
+""")
         # ── Session state ─────────────────────────────────────────────
         if "t1_pool" not in st.session_state:
             st.session_state["t1_pool"] = empty_pool()
@@ -1976,7 +1980,15 @@ def streamlit_main():
 
     with tab2:
         import datetime as _dt
-        st.write("管理持股記錄、追蹤損益，並查看買賣歷史與統計摘要。")
+        st.info("""
+**💼 我的持股** — 管理買進記錄、追蹤損益、記錄賣出並統計交易成績
+
+📋 **功能**：新增買進記錄 → 每日更新現價看損益與操作建議（續抱/減碼/出場）
+→ 記錄賣出並自動計算實現損益 → 查看勝率、平均報酬等統計摘要。
+
+⏰ **建議執行時間**：**有持股時，每天收盤後（14:00 以後）看一次**
+換裝置使用時，先上傳你的持股 Excel 檔，操作完再下載儲存。
+""")
         st.caption("每個人各自維護一個 Excel 檔（例如 持股記錄_Annie.xlsx），上傳後操作，完成後下載儲存。")
 
         # ── Session state 初始化 ─────────────────────────────────────────
@@ -2164,13 +2176,39 @@ def streamlit_main():
         )
 
     with tab3:
-        st.write("Backer 版全市場掃描：一次下載全市場資料，同時做基本面 + 籌碼面全面分析。")
-        st.markdown("""
-**升級優勢（Backer 方案）**
-- 只需 **6~7 次** API 請求即可取得全市場 ~1,800 支股票的所有資料
-- 從原本分兩批等 2 小時，縮短為 **5~10 分鐘**跑完全市場
-- 不需要技術初篩步驟，直接全市場掃描
-        """)
+        st.info("""
+**🔬 全面分析（基本面 + 籌碼）** — 從全市場 ~1,800 支股票中，同時篩選基本面優質且法人有興趣的標的
+
+📋 **功能**：全市場股價技術初篩 → 同時做基本面（EPS/毛利率/負債比/現金流等）
+和籌碼面（三大法人連買/融資券/軋空等）分析 → 依「雙面確認/基本面/籌碼」分三組顯示。
+
+⏰ **建議執行時間**：**每週一次，收盤後（14:00 以後）執行**
+分頁 3 使用 FinMind 資料，盤中資料尚未更新，執行無意義。
+非交易日（週六日）執行可能取不到完整資料。
+""")
+
+        # ── 多人共用 Token 說明 ────────────────────────────────────────
+        st.warning("""
+⚠️ **多人共用注意事項（重要）**
+
+本程式共用同一個 FinMind token，每次全市場分析約使用 **9 次 API 請求**，
+Backer 方案每小時上限約 **1,500 次**。
+
+**若多人同時執行，短時間內用量可能達到上限。建議：**
+- 🕐 家人之間**錯開時間**執行（間隔至少 30 分鐘）
+- 📅 每人每週只需執行**一次**，結果下載 Excel 後平日使用
+- 🚫 **不要重複按執行按鈕**，每次都會消耗用量
+- 💡 每週可指定一個人執行，把結果 Excel 分享給其他人
+""")
+
+        st.caption("""
+📊 **執行完成後的結果欄位說明：**
+代號、股票名稱、收盤價、**綜合評級**（⭐⭐雙面確認 / 📊基本面通過 / 🏦籌碼訊號）、
+基本面通過（✅/—）、籌碼訊號（✅/—）、做多訊號種類（C1~C12）、籌碼風險（B8~B10）、
+近季EPS、近四季EPS合計、近三月營收YoY%、負債比%、基本面通過項數、20日漲幅%、量比。
+執行完後按「📥 下載全面分析結果 Excel」，包含「篩選結果」和「掃描摘要」兩個工作表。
+""")
+
         st.caption("⚠️ A8/B7(董監質押)與 B11(處置/警示股)FinMind 無資料，請手動填入排除清單。")
 
         # ── Token ─────────────────────────────────────────────────────
@@ -2327,7 +2365,18 @@ def streamlit_main():
 
     with tab4:
         import datetime as _dt
-        st.write("記錄分頁 1 的推薦結果，追蹤模擬損益，分析程式預測能力。")
+        st.info("""
+**🎯 模擬投資追蹤** — 記錄分頁 1 的推薦結果，追蹤模擬損益，分析程式預測能力
+
+📋 **功能**：從分頁 1 一鍵加入推薦股票 → 每日按更新按鈕自動比對停損/目標價
+→ 觸發時自動結算 → 累積記錄後分析程式勝率、高分 vs 低分表現、
+有無進場訊號的差異、各產業勝率排名、月度趨勢等。
+
+⏰ **建議執行時間**：
+- **加入追蹤**：在分頁 1 選股後立即加入
+- **更新現價**：每天收盤後（14:00 以後）按一次更新
+- 換裝置使用時，先上傳模擬投資記錄 Excel，操作完記得下載儲存
+""")
         st.caption("資料存在你的 Excel 檔案中，換裝置時上傳即可延續記錄。")
 
         # ── Session state ─────────────────────────────────────────────
